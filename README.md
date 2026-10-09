@@ -1,0 +1,87 @@
+# sxfer
+
+Move a file - or a secret like a password or OTP - from one machine to another: encrypted in
+transit, receipt proven against the receiver's disk, then the source is shredded. One static
+binary, no runtime dependencies.
+
+## LAN: direct, paired by a one-time code
+
+```
+# receiver
+sxfer listen                      # prints a one-time code, e.g. 482-913
+sxfer listen --dir ~/Downloads    # choose where files land
+
+# sender (once per network)
+sxfer config add 192.168.2.0/24   # networks to search for listeners (IP or CIDR)
+sxfer config list | remove <net>
+
+# sender
+sxfer send report.pdf             # finds the listener, asks for the code, sends, shreds
+sxfer send                        # no file: type a secret (hidden); shown once on the receiver, never saved
+echo "$OTP" | sxfer send          # secret from stdin
+sxfer send file --to 192.168.2.50 # skip discovery
+```
+
+Listeners use TCP and UDP port **47331** (`--port` on both sides to change it). On Windows, allow
+`sxfer.exe` through the firewall on the receiving machine the first time.
+
+## SSH: through your existing ssh setup
+
+```
+sxfer push secrets.txt web1:/root/    # send, verify, shred the local copy
+sxfer pull web1:/root/secrets.txt .   # fetch, verify, shred the remote copy
+```
+
+Uses your `ssh` client and `~/.ssh/config` (aliases, keys, agents). The remote side needs only
+`sh`, coreutils `sha256sum` and `shred`.
+
+## Options (send / push / pull)
+
+| | |
+|---|---|
+| `--keep` | verify and commit, but don't shred the source |
+| `--ask` | ask before shredding (default: shred as soon as receipt is confirmed) |
+| `--passes N` | random overwrite passes before the final zero pass (default 3) |
+
+## How it works
+
+1. **Hash** the source (SHA-256 + size).
+2. **Send** into `<name>.sxfer-part` on the receiver (mode 600 on Unix), fsync.
+3. **Verify** - the receiver re-reads the file *from disk* and checks it; the sender re-hashes its
+   source too (catches a file that changed mid-transfer).
+4. **Commit** - atomic, never overwrites an existing file. If the destination already holds the
+   identical file (an earlier run whose receipt got lost), it counts as delivered.
+5. **Shred** the source: N random passes + zeros, fsync each, truncate, rename, unlink.
+6. **Receipt** - logged on the **destination only** (`~/.sxfer/receipts.jsonl`). The source keeps no
+   record of what it shredded.
+
+Any failure before step 5 deletes the partial copy and leaves the source untouched; just rerun.
+SSH mode uses keepalives and a hang-up-proof remote shred, so a dropped connection is detected in
+about 30 s and never interrupts a shred halfway.
+
+### LAN security
+
+- **SPAKE2** (Ed25519 group) turns the 6-digit code into a strong shared key. The code never crosses
+  the network, an eavesdropper can't test guesses offline, and an active attacker gets one guess per
+  connection. The listener closes after 3 wrong codes (odds of guessing: 3 in a million).
+- **ChaCha20-Poly1305** with HKDF-SHA256-derived keys, one per direction, counter nonces.
+- File names from the sender are reduced to a bare name (no paths, no `..`).
+- Secrets are capped at 64 KiB, shown once on the receiver's terminal, and never written to disk.
+
+### Shredding caveat
+
+Overwriting is reliable on spinning disks. On SSDs (wear levelling), copy-on-write or journaling
+filesystems, cloud-synced folders (OneDrive/Dropbox, which sxfer warns about), snapshots and
+backups, old copies of the data can survive. Full-disk encryption (BitLocker / FileVault / LUKS)
+is what really protects deleted data.
+
+## Building
+
+```
+cargo test
+./build.sh        # Linux/WSL: cross-compiles all six targets into dist/ (needs zig + cargo-zigbuild)
+```
+
+Tagging `vX.Y.Z` runs `.github/workflows/release.yml`: tests on Linux, Windows and macOS, then
+native builds for Linux (x86-64, ARM64, static), Windows (x86-64, ARM64) and macOS (Intel, Apple
+Silicon), published to a GitHub release with `SHA256SUMS`.

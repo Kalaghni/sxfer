@@ -1,5 +1,7 @@
 # sxfer
 
+[![build](https://github.com/Kalaghni/sxfer/actions/workflows/build.yml/badge.svg)](https://github.com/Kalaghni/sxfer/actions/workflows/build.yml)
+
 Move a file - or a secret like a password or OTP - from one machine to another: encrypted in
 transit, receipt proven against the receiver's disk, then the source is shredded. One static
 binary, no runtime dependencies.
@@ -32,8 +34,8 @@ which is usually already open on home networks.
 ## SSH: through your existing ssh setup
 
 ```
-sxfer push secrets.txt web1:/root/    # send, verify, shred the local copy
-sxfer pull web1:/root/secrets.txt .   # fetch, verify, shred the remote copy
+sxfer push secrets.txt myserver:/root/    # send, verify, shred the local copy
+sxfer pull myserver:/root/secrets.txt .   # fetch, verify, shred the remote copy
 ```
 
 Uses your `ssh` client and `~/.ssh/config` (aliases, keys, agents). The remote side needs only
@@ -86,6 +88,13 @@ cargo test
 ./build.sh        # Linux/WSL: cross-compiles all six targets into dist/ (needs zig + cargo-zigbuild)
 ```
 
-Tagging `vX.Y.Z` runs `.github/workflows/release.yml`: tests on Linux, Windows and macOS, then
-native builds for Linux (x86-64, ARM64, static), Windows (x86-64, ARM64) and macOS (Intel, Apple
-Silicon), published to a GitHub release with `SHA256SUMS`.
+Every push and pull request runs `.github/workflows/build.yml`: fmt, clippy and tests on Linux,
+Windows and macOS, then native builds for Linux (x86-64, ARM64, static), Windows (x86-64, ARM64)
+and macOS (Intel, Apple Silicon), uploaded as workflow artifacts. Tagging `vX.Y.Z` also publishes
+them to a GitHub release with `SHA256SUMS`.
+
+## Download
+
+Grab a binary from [Releases](https://github.com/Kalaghni/sxfer/releases), or the artifacts of the
+latest [build run](https://github.com/Kalaghni/sxfer/actions). Check it against `SHA256SUMS`, then
+put it on your PATH. On macOS, a downloaded binary may need `xattr -d com.apple.quarantine sxfer`.

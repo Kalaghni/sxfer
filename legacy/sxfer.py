@@ -9,7 +9,7 @@ sxfer - move a file between machines over SSH: encrypted transfer, proven receip
               --passes N overwrite passes when shredding (default 3, then zeros)
               --ask      ask before shredding (default: shred as soon as receipt is confirmed)
 
-<host> is anything `ssh` accepts (aliases from ~/.ssh/config, e.g. web1). A path ending in / or naming
+<host> is anything `ssh` accepts (aliases from ~/.ssh/config, e.g. myserver). A path ending in / or naming
 an existing directory receives the file under its own name. Existing files are never overwritten.
 
 PROTOCOL (each step must succeed before the next; any failure leaves the source intact)

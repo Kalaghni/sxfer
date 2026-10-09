@@ -1,0 +1,112 @@
+name: build
+# Every push / PR: test on Linux, Windows, macOS, then build all six binaries as downloadable artifacts.
+# Tag vX.Y.Z: the same, plus a GitHub release with the binaries and SHA256SUMS.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl,  os: ubuntu-latest,  zig: true,  run: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest,  zig: true,  run: false }
+          - { target: x86_64-pc-windows-msvc,     os: windows-latest, zig: false, run: true }
+          - { target: aarch64-pc-windows-msvc,    os: windows-latest, zig: false, run: false }
+          - { target: x86_64-apple-darwin,        os: macos-latest,   zig: false, run: false }
+          - { target: aarch64-apple-darwin,       os: macos-latest,   zig: false, run: true }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - uses: actions/setup-python@v5
+        if: matrix.zig
+        with:
+          python-version: '3.12'
+      - name: install zig + cargo-zigbuild
+        if: matrix.zig
+        run: |
+          python -m pip install ziglang
+          cargo install cargo-zigbuild --locked
+      - name: build (zig, static musl)
+        if: matrix.zig
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }}
+      - name: build (native toolchain)
+        if: ${{ !matrix.zig }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: package
+        id: pkg
+        shell: bash
+        run: |
+          ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "$GITHUB_REF_TYPE" = tag ] || ver="$ver-${GITHUB_SHA::7}"
+          ext=""; [[ "${{ matrix.target }}" == *windows* ]] && ext=.exe
+          mkdir dist
+          out="dist/sxfer-$ver-${{ matrix.target }}$ext"
+          cp "target/${{ matrix.target }}/release/sxfer$ext" "$out"
+          echo "file=$out" >> "$GITHUB_OUTPUT"
+          ls -l dist
+      - name: smoke test
+        if: matrix.run
+        shell: bash
+        run: |
+          "${{ steps.pkg.outputs.file }}" --version
+          "${{ steps.pkg.outputs.file }}" --help >/dev/null
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sxfer-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: cd dist && sha256sum sxfer-* > SHA256SUMS && cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

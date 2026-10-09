@@ -4,6 +4,10 @@ version = "0.4.0"
 edition = "2021"
 description = "Move a file or a secret between machines: encrypted, proven receipt, then shred the source."
 license = "MIT"
+repository = "https://github.com/Kalaghni/sxfer"
+readme = "README.md"
+keywords = ["file-transfer", "spake2", "shred", "mdns", "secure"]
+categories = ["command-line-utilities", "cryptography"]
 rust-version = "1.80"
 
 [dependencies]

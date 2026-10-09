@@ -36,11 +36,26 @@ pub fn say(msg: &str) {
     eprintln!("sxfer: {msg}");
 }
 
-#[derive(Clone, Debug)]
+/// Answers "Shred ...?" instead of the terminal, e.g. the MCP server asking its client's user.
+pub type Asker = std::rc::Rc<dyn Fn(&str) -> bool>;
+
+#[derive(Clone)]
 pub struct ShredCfg {
     pub keep: bool,
     pub ask: bool,
     pub passes: u32,
+    /// None: ask on the terminal
+    pub asker: Option<Asker>,
+}
+
+impl ShredCfg {
+    /// Whether to shred now that receipt is confirmed (`keep` is checked by the caller).
+    pub fn confirm(&self, question: &str) -> bool {
+        match &self.asker {
+            Some(ask) if self.ask => ask(question),
+            _ => confirm(question, self.ask),
+        }
+    }
 }
 
 pub fn hex(b: &[u8]) -> String {
@@ -119,13 +134,19 @@ pub fn shred_local(p: &Path, passes: u32) -> R<()> {
     Ok(())
 }
 
-pub fn cloud_warning(p: &Path) {
+/// Cloud-sync folders `p` is inside; shredding can't reach their cloud copies.
+pub fn cloud_markers(p: &Path) -> Vec<&'static str> {
     let abs = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let s = abs.to_string_lossy().to_lowercase();
-    for m in ["onedrive", "dropbox", "google drive", "icloud"] {
-        if s.contains(m) {
-            say(&format!("WARNING: source is in a {m} folder; the cloud copy and its version history are NOT shredded"));
-        }
+    ["onedrive", "dropbox", "google drive", "icloud"]
+        .into_iter()
+        .filter(|m| s.contains(m))
+        .collect()
+}
+
+pub fn cloud_warning(p: &Path) {
+    for m in cloud_markers(p) {
+        say(&format!("WARNING: source is in a {m} folder; the cloud copy and its version history are NOT shredded"));
     }
 }
 

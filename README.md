@@ -41,6 +41,34 @@ sxfer pull myserver:/root/secrets.txt .   # fetch, verify, confirm, shred the re
 Uses your `ssh` client and `~/.ssh/config` (aliases, keys, agents). The remote side needs only
 `sh`, coreutils `sha256sum` and `shred`.
 
+## MCP server: let an AI assistant move files
+
+`sxfer-mcp` is a second binary that speaks the [Model Context Protocol](https://modelcontextprotocol.io)
+over stdio, so an assistant such as Claude can send, push, pull and receive files with the same
+hash / verify / commit / shred steps.
+
+```
+claude mcp add sxfer -- sxfer-mcp          # Claude Code; other clients: command `sxfer-mcp`, no args
+```
+
+| Tool | |
+|---|---|
+| `send_file` | LAN send to an `sxfer listen` receiver (`path`, `code`, optional `to`, `keep`, `passes`) |
+| `push_file` / `pull_file` | over SSH, like `sxfer push` / `pull` |
+| `start_listener` / `listener_status` / `stop_listener` | receive one file in the background; returns the code for the sender |
+| `discover_listeners`, `get_config` | read-only |
+
+Rules that hold whatever the model asks:
+
+- **You decide on every shred, not the model.** Once the receiver's copy is verified, the server asks
+  *you* directly through an MCP prompt (elicitation) that the model can't answer. Anything but an
+  explicit yes keeps the source, and so does a client without elicitation support or no answer
+  within 9 minutes. No tool takes a "yes"/"confirm" argument; `sxfer config confirm` doesn't apply.
+- **Files only.** Secrets would land in the model's context and the transcript, so there's no tool
+  for them, and a listener started over MCP refuses them. Use `sxfer send` for passwords and OTPs.
+- **The network allowlist is yours.** The server reads `sxfer config` but can't change it.
+- Paths must be absolute. SSH runs with `BatchMode=yes`: key or agent auth only, no prompts.
+
 ## Options (send / push / pull)
 
 | | |
@@ -100,13 +128,16 @@ is what really protects deleted data.
 ## Building
 
 ```
-cargo test
-./build.sh        # Linux/WSL: cross-compiles all six targets into dist/ (needs zig + cargo-zigbuild)
+cargo test --workspace
+./build.sh        # Linux/WSL: cross-compiles sxfer + sxfer-mcp for all six targets into dist/ (needs zig + cargo-zigbuild)
 ```
 
+The repo is a Cargo workspace: the root crate is the `sxfer` library + CLI, `sxfer-mcp/` the MCP server
+built on that library.
+
 Every push and pull request runs `.github/workflows/build.yml`: fmt, clippy and tests on Linux,
-Windows and macOS, then native builds for Linux (x86-64, ARM64, static), Windows (x86-64, ARM64)
-and macOS (Intel, Apple Silicon), uploaded as workflow artifacts. Tagging `vX.Y.Z` also publishes
+Windows and macOS, then native builds of both binaries for Linux (x86-64, ARM64, static), Windows
+(x86-64, ARM64) and macOS (Intel, Apple Silicon), uploaded as workflow artifacts. Tagging `vX.Y.Z` also publishes
 them to a GitHub release with `SHA256SUMS`.
 
 ## Download

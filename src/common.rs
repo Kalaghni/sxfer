@@ -151,7 +151,8 @@ pub fn prompt_line(prompt: &str) -> R<String> {
         .ok_or_else(|| Abort("no terminal to read from".into()))
 }
 
-/// Shred without asking unless --ask was given.
+/// Ask on the terminal before shredding, unless `ask` is false (-y, or `sxfer config confirm off`).
+/// With no terminal to ask on, the answer is no and the source is kept.
 pub fn confirm(question: &str, ask: bool) -> bool {
     if !ask {
         return true;
@@ -159,7 +160,7 @@ pub fn confirm(question: &str, ask: bool) -> bool {
     match tty_line(&format!("{question} [y/N] ")) {
         Some(a) => matches!(a.trim().to_lowercase().as_str(), "y" | "yes"),
         None => {
-            say("no terminal to confirm on; not shredding (drop --ask to shred automatically)");
+            say("no terminal to ask on; not shredding (-y or `sxfer config confirm off` to skip)");
             false
         }
     }

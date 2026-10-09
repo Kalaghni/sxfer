@@ -1,4 +1,5 @@
-//! ~/.sxfer/config.json: the networks `sxfer send` searches for listeners.
+//! ~/.sxfer/config.json: the networks `sxfer send` searches for listeners, and whether
+//! send / push / pull ask before shredding.
 
 use crate::abort;
 use crate::common::*;
@@ -12,6 +13,15 @@ use std::path::PathBuf;
 pub struct Config {
     #[serde(default)]
     pub networks: Vec<String>,
+    /// Ask before shredding the source. Unset means yes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_shred: Option<bool>,
+}
+
+impl Config {
+    pub fn confirm_shred(&self) -> bool {
+        self.confirm_shred.unwrap_or(true)
+    }
 }
 
 fn path() -> PathBuf {
@@ -72,8 +82,30 @@ pub fn remove(s: &str) -> R<()> {
     Ok(())
 }
 
+/// Show the shred-confirmation setting, or set it (`on` = ask before shredding).
+pub fn confirm(on: Option<bool>) -> R<()> {
+    let mut c = load();
+    if let Some(on) = on {
+        c.confirm_shred = Some(on);
+        save(&c)?;
+    }
+    say(&format!(
+        "shred confirmation is {}",
+        if c.confirm_shred() {
+            "on: send / push / pull ask before shredding (-y skips it once)"
+        } else {
+            "off: the source is shredded once receipt is confirmed (--ask asks once)"
+        }
+    ));
+    Ok(())
+}
+
 pub fn list() {
     let c = load();
+    say(&format!(
+        "shred confirmation: {}",
+        if c.confirm_shred() { "on" } else { "off" }
+    ));
     if c.networks.is_empty() {
         say("no networks configured; add one with: sxfer config add 192.168.2.0/24");
     }

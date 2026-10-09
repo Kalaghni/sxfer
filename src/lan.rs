@@ -11,7 +11,8 @@
 //! TRANSFER   header {kind, name, size, sha256} -> ACCEPT/REJECT -> data frames -> END.
 //!            The listener writes <name>.sxfer-part, fsyncs, re-reads it FROM DISK, checks size +
 //!            sha256, commits with a no-clobber rename and replies RECEIPT. Only then does the
-//!            sender (re-hashing its source first) shred, and tells the listener it did (DONE).
+//!            sender (re-hashing its source first, and asking first unless confirmation is off)
+//!            shred, and tells the listener whether it did (DONE).
 //!            Secrets (kind "text") are shown on the listener's screen and never written to disk.
 //! RECEIPTS   on the destination only (the listener). The sender keeps no record.
 
@@ -42,6 +43,8 @@ const MAX_FRAME: usize = 4 << 20;
 const MAX_TEXT: u64 = 64 * 1024;
 const MAX_BAD_CODES: u32 = 3;
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long the listener waits for DONE after its receipt: the sender may be answering the shred prompt.
+const DONE_TIMEOUT: Duration = Duration::from_secs(600);
 
 const T_HEADER: u8 = 1;
 const T_DATA: u8 = 2;
@@ -438,6 +441,7 @@ fn handle(mut s: TcpStream, code: &str, dir: &Path) -> R<Received> {
             already,
         },
     )?;
+    let _ = ch.s.set_read_timeout(Some(DONE_TIMEOUT));
     let shredded = match ch.recv() {
         Ok((T_DONE, b)) => parse_json::<Done>(&b, "done").ok().map(|d| d.shredded),
         _ => None,

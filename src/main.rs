@@ -12,7 +12,7 @@ mod config;
 mod lan;
 mod ssh;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use common::*;
 use std::io::{IsTerminal, Read};
 use std::net::SocketAddr;
@@ -35,25 +35,36 @@ struct ShredOpts {
     /// Verify and commit, but don't shred the source
     #[arg(long)]
     keep: bool,
-    /// Ask before shredding (default: shred as soon as receipt is confirmed)
+    /// Shred without asking this time (overrides `sxfer config confirm on`, the default)
+    #[arg(long, short = 'y', conflicts_with = "ask")]
+    yes: bool,
+    /// Ask before shredding this time (overrides `sxfer config confirm off`)
     #[arg(long)]
     ask: bool,
     /// Random overwrite passes before the final zero pass
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..))]
     passes: u32,
-    /// (old flag; shredding without asking is now the default)
-    #[arg(long, short = 'y', hide = true)]
-    yes: bool,
 }
 
 impl ShredOpts {
     fn cfg(&self) -> ShredCfg {
         ShredCfg {
             keep: self.keep,
-            ask: self.ask,
+            ask: resolve_ask(self.yes, self.ask, config::load().confirm_shred()),
             passes: self.passes,
         }
     }
+}
+
+/// A flag decides for this run; otherwise the configured setting (default: ask).
+fn resolve_ask(yes: bool, ask: bool, configured: bool) -> bool {
+    !yes && (ask || configured)
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Toggle {
+    On,
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -76,7 +87,7 @@ enum Cmd {
         #[command(flatten)]
         shred: ShredOpts,
     },
-    /// Networks `send` will connect to (an allowlist for discovered listeners)
+    /// Networks `send` will connect to (an allowlist), and whether shredding asks first
     Config {
         #[command(subcommand)]
         action: ConfigCmd,
@@ -105,8 +116,10 @@ enum ConfigCmd {
     Add { net: String },
     /// Remove a network
     Remove { net: String },
-    /// Show configured networks
+    /// Show configured networks and the shred-confirmation setting
     List,
+    /// Ask before shredding (on, the default) or shred once receipt is confirmed (off). No value: show it
+    Confirm { state: Option<Toggle> },
 }
 
 fn main() {
@@ -126,6 +139,7 @@ fn main() {
                 config::list();
                 Ok(())
             }
+            ConfigCmd::Confirm { state } => config::confirm(state.map(|t| matches!(t, Toggle::On))),
         },
         Cmd::Push { src, dest, shred } => ssh::push(&src, &dest, &shred.cfg()),
         Cmd::Pull { src, dest, shred } => ssh::pull(&src, &dest, &shred.cfg()),
@@ -276,5 +290,31 @@ fn pick_listener() -> R<SocketAddr> {
                 .map(|(_, a)| *a)
                 .ok_or_else(|| Abort("no such listener".into()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flags_override_configured_confirmation() {
+        assert!(resolve_ask(false, false, true), "default config asks");
+        assert!(!resolve_ask(false, false, false), "config off shreds without asking");
+        assert!(!resolve_ask(true, false, true), "-y skips the prompt");
+        assert!(resolve_ask(false, true, false), "--ask asks despite config off");
+    }
+
+    #[test]
+    fn yes_and_ask_conflict() {
+        assert!(Cli::try_parse_from(["sxfer", "push", "a", "h:/", "-y", "--ask"]).is_err());
+    }
+
+    #[test]
+    fn confirm_unset_means_ask() {
+        let c: config::Config = serde_json::from_str(r#"{"networks":[]}"#).unwrap();
+        assert!(c.confirm_shred());
+        let c: config::Config = serde_json::from_str(r#"{"confirm_shred":false}"#).unwrap();
+        assert!(!c.confirm_shred());
     }
 }

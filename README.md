@@ -3,8 +3,8 @@
 [![build](https://github.com/Kalaghni/sxfer/actions/workflows/build.yml/badge.svg)](https://github.com/Kalaghni/sxfer/actions/workflows/build.yml)
 
 Move a file - or a secret like a password or OTP - from one machine to another: encrypted in
-transit, receipt proven against the receiver's disk, then the source is shredded. One static
-binary, no runtime dependencies.
+transit, receipt proven against the receiver's disk, then (once you say yes) the source is
+shredded. One static binary, no runtime dependencies.
 
 ## LAN: direct, paired by a one-time code
 
@@ -18,7 +18,7 @@ sxfer config add 192.168.2.0/24   # networks you'll connect to (IP or CIDR) - an
 sxfer config list | remove <net>
 
 # sender
-sxfer send report.pdf             # finds the listener, asks for the code, sends, shreds
+sxfer send report.pdf             # finds the listener, asks for the code, sends, asks, shreds
 sxfer send                        # no file: type a secret (hidden); shown once on the receiver, never saved
 echo "$OTP" | sxfer send          # secret from stdin
 sxfer send file --to 192.168.2.50:51234   # skip discovery (the listener prints its port)
@@ -34,8 +34,8 @@ which is usually already open on home networks.
 ## SSH: through your existing ssh setup
 
 ```
-sxfer push secrets.txt myserver:/root/    # send, verify, shred the local copy
-sxfer pull myserver:/root/secrets.txt .   # fetch, verify, shred the remote copy
+sxfer push secrets.txt myserver:/root/    # send, verify, confirm, shred the local copy
+sxfer pull myserver:/root/secrets.txt .   # fetch, verify, confirm, shred the remote copy
 ```
 
 Uses your `ssh` client and `~/.ssh/config` (aliases, keys, agents). The remote side needs only
@@ -46,8 +46,23 @@ Uses your `ssh` client and `~/.ssh/config` (aliases, keys, agents). The remote s
 | | |
 |---|---|
 | `--keep` | verify and commit, but don't shred the source |
-| `--ask` | ask before shredding (default: shred as soon as receipt is confirmed) |
+| `-y`, `--yes` | shred without asking, this time |
+| `--ask` | ask before shredding, this time (when confirmation is turned off) |
 | `--passes N` | random overwrite passes before the final zero pass (default 3) |
+
+### Shred confirmation
+
+Once the receipt checks out, sxfer asks `Shred <file>? [y/N]` before touching the source. Anything
+but `y` keeps it. With no terminal to ask on (cron, CI) and no `-y`, the source is kept too.
+
+```
+sxfer config confirm          # show the setting
+sxfer config confirm off      # shred as soon as receipt is confirmed (the pre-0.5 behaviour)
+sxfer config confirm on       # ask first (the default)
+```
+
+The setting lives in `~/.sxfer/config.json` (`"confirm_shred": false`) on the machine running
+send / push / pull. `-y` and `--ask` override it for one run.
 
 ## How it works
 
@@ -57,7 +72,8 @@ Uses your `ssh` client and `~/.ssh/config` (aliases, keys, agents). The remote s
    source too (catches a file that changed mid-transfer).
 4. **Commit** - atomic, never overwrites an existing file. If the destination already holds the
    identical file (an earlier run whose receipt got lost), it counts as delivered.
-5. **Shred** the source: N random passes + zeros, fsync each, truncate, rename, unlink.
+5. **Shred** the source, once confirmed: N random passes + zeros, fsync each, truncate, rename,
+   unlink.
 6. **Receipt** - logged on the **destination only** (`~/.sxfer/receipts.jsonl`). The source keeps no
    record of what it shredded.
 

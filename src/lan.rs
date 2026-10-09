@@ -33,6 +33,8 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const SERVICE: &str = "_sxfer._tcp.local.";
@@ -209,6 +211,10 @@ pub struct ListenCfg {
     pub dir: PathBuf,
     /// advertise over mDNS (off in the tests)
     pub advertise: bool,
+    /// take secrets as well as files (the MCP server takes files only)
+    pub accept_text: bool,
+    /// set it to close the listener while it waits for a sender
+    pub stop: Option<Arc<AtomicBool>>,
 }
 
 /// An mDNS advertisement; dropping it sends the "goodbye" and stops the responder.
@@ -275,18 +281,29 @@ pub fn listen_core(cfg: &ListenCfg, code: &str, ready: &mut dyn FnMut(u16)) -> R
     };
     ready(port);
     let code = normalize_code(code);
+    if cfg.stop.is_some() {
+        tcp.set_nonblocking(true)?; // poll, so the stop flag is noticed
+    }
     let mut bad = 0;
     let result = loop {
         let (stream, peer) = match tcp.accept() {
             Ok(x) => x,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if cfg.stop.as_ref().is_some_and(|s| s.load(Ordering::Relaxed)) {
+                    break Err(Abort("listener stopped".into()));
+                }
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
             Err(e) => {
                 say(&format!("accept failed: {e}"));
                 continue;
             }
         };
+        let _ = stream.set_nonblocking(false); // inherited from the listener on some platforms
         let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
         let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-        match handle(stream, &code, &cfg.dir) {
+        match handle(stream, &code, &cfg.dir, cfg.accept_text) {
             Ok(r) => break Ok(r),
             Err(e) if e.0 == BAD_CODE => {
                 bad += 1;
@@ -301,7 +318,7 @@ pub fn listen_core(cfg: &ListenCfg, code: &str, ready: &mut dyn FnMut(u16)) -> R
     result
 }
 
-fn handle(mut s: TcpStream, code: &str, dir: &Path) -> R<Received> {
+fn handle(mut s: TcpStream, code: &str, dir: &Path, accept_text: bool) -> R<Received> {
     let first = read_frame(&mut s)?;
     let Some(msg_a) = first.strip_prefix(MAGIC) else {
         abort!("not an sxfer sender")
@@ -324,6 +341,15 @@ fn handle(mut s: TcpStream, code: &str, dir: &Path) -> R<Received> {
     let h: Header = parse_json(&body, "header")?;
 
     if h.kind == "text" {
+        if !accept_text {
+            ch.send_json(
+                T_REJECT,
+                &Reason {
+                    reason: "this listener takes files only, not secrets".into(),
+                },
+            )?;
+            abort!("rejected a secret (files only)");
+        }
         if h.size > MAX_TEXT {
             ch.send_json(
                 T_REJECT,
@@ -626,12 +652,10 @@ pub fn send_core(addr: SocketAddr, code: &str, payload: &Payload, sc: &ShredCfg)
             say("3/6 verified listener's copy (re-read from its disk) matches");
             say(&format!("4/6 committed {where_}  (receipt confirmed)"));
         }
+        let question = format!("Receipt confirmed. Shred local {}?", p.display());
         if sc.keep {
             say("5/6 --keep: source left in place");
-        } else if confirm(
-            &format!("Receipt confirmed. Shred local {}?", p.display()),
-            sc.ask,
-        ) {
+        } else if sc.confirm(&question) {
             shred_local(p, sc.passes)?;
             shredded = true;
             say(&format!(
@@ -756,6 +780,7 @@ mod tests {
             keep: false,
             ask: false,
             passes: 1,
+            asker: None,
         }
     }
 
@@ -770,6 +795,8 @@ mod tests {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 dir,
                 advertise: false,
+                accept_text: true,
+                stop: None,
             };
             listen_core(&cfg, code, &mut |p| tx.send(p).unwrap())
         });
@@ -825,6 +852,31 @@ mod tests {
             assert!(send_core(addr, "123-123", &Payload::Text("x".into()), &sc()).is_err());
         }
         assert!(h.join().unwrap().err().unwrap().0.contains("wrong codes"));
+    }
+
+    #[test]
+    fn files_only_listener_refuses_secrets_and_can_be_stopped() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let (dir, flag) = (tmpdir("dst"), stop.clone());
+        let h = std::thread::spawn(move || {
+            let cfg = ListenCfg {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                dir,
+                advertise: false,
+                accept_text: false,
+                stop: Some(flag),
+            };
+            listen_core(&cfg, "321-321", &mut |p| tx.send(p).unwrap())
+        });
+        let port = rx.recv().unwrap();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let e = send_core(addr, "321-321", &Payload::Text("hunter2".into()), &sc())
+            .err()
+            .unwrap();
+        assert!(e.0.contains("files only"), "{e}");
+        stop.store(true, Ordering::Relaxed);
+        assert!(h.join().unwrap().err().unwrap().0.contains("stopped"));
     }
 
     #[test]
@@ -900,6 +952,8 @@ mod tests {
                 bind: "0.0.0.0:0".parse().unwrap(),
                 dir,
                 advertise: true,
+                accept_text: true,
+                stop: None,
             };
             listen_core(&cfg, "777-777", &mut |p| tx.send(p).unwrap())
         });

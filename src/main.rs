@@ -7,17 +7,13 @@
 //! filesystems, cloud-synced folders, snapshots and backups, old copies can survive. Full-disk
 //! encryption (BitLocker / FileVault / LUKS) is what really protects deleted data there.
 
-mod common;
-mod config;
-mod lan;
-mod ssh;
-
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use common::*;
 use std::io::{IsTerminal, Read};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
+use sxfer::common::*;
+use sxfer::{config, lan, ssh};
 
 #[derive(Parser)]
 #[command(
@@ -52,6 +48,7 @@ impl ShredOpts {
             keep: self.keep,
             ask: resolve_ask(self.yes, self.ask, config::load().confirm_shred()),
             passes: self.passes,
+            asker: None,
         }
     }
 }
@@ -141,8 +138,8 @@ fn main() {
             }
             ConfigCmd::Confirm { state } => config::confirm(state.map(|t| matches!(t, Toggle::On))),
         },
-        Cmd::Push { src, dest, shred } => ssh::push(&src, &dest, &shred.cfg()),
-        Cmd::Pull { src, dest, shred } => ssh::pull(&src, &dest, &shred.cfg()),
+        Cmd::Push { src, dest, shred } => ssh::push(&src, &dest, &shred.cfg()).map(|_| ()),
+        Cmd::Pull { src, dest, shred } => ssh::pull(&src, &dest, &shred.cfg()).map(|_| ()),
     };
     if let Err(e) = r {
         say(&format!("ABORTED: {e}"));
@@ -152,7 +149,7 @@ fn main() {
 
 fn listen(dir: PathBuf) -> R<()> {
     if !dir.is_dir() {
-        crate::abort!("no such directory: {}", dir.display());
+        sxfer::abort!("no such directory: {}", dir.display());
     }
     let code = lan::new_code();
     let shown_dir = std::fs::canonicalize(&dir).unwrap_or(dir.clone());
@@ -160,6 +157,8 @@ fn listen(dir: PathBuf) -> R<()> {
         bind: SocketAddr::from(([0, 0, 0, 0], 0)), // any free port; mDNS tells senders which
         dir,
         advertise: true,
+        accept_text: true,
+        stop: None,
     };
     let got = lan::listen_core(&cfg, &code, &mut |p| {
         let ip = lan::primary_ip()
@@ -221,7 +220,7 @@ fn send(file: Option<PathBuf>, to: Option<String>, code: Option<String>, sc: Shr
                 s.trim_end_matches(['\r', '\n']).to_string()
             };
             if t.is_empty() {
-                crate::abort!("nothing to send");
+                sxfer::abort!("nothing to send");
             }
             lan::Payload::Text(t)
         }
@@ -236,7 +235,7 @@ fn send(file: Option<PathBuf>, to: Option<String>, code: Option<String>, sc: Shr
         None => prompt_line(&format!("sxfer: one-time code shown on {addr}: "))?,
     };
     if lan::normalize_code(&code).len() != 6 {
-        crate::abort!("the code is 6 digits, like 482-913");
+        sxfer::abort!("the code is 6 digits, like 482-913");
     }
     let sent = lan::send_core(addr, &code, &payload, &sc)?;
     if let lan::Payload::Text(_) = payload {
@@ -252,7 +251,7 @@ fn send(file: Option<PathBuf>, to: Option<String>, code: Option<String>, sc: Shr
 fn pick_listener() -> R<SocketAddr> {
     let nets = config::networks()?;
     if nets.is_empty() {
-        crate::abort!(
+        sxfer::abort!(
             "no networks configured. Add yours first, e.g.: sxfer config add 192.168.2.0/24   (or use --to <ip>:<port>)"
         );
     }
@@ -272,7 +271,7 @@ fn pick_listener() -> R<SocketAddr> {
         ));
     }
     match ok.len() {
-        0 => crate::abort!(
+        0 => sxfer::abort!(
             "no listener found on {}. Is `sxfer listen` running on the same network, and is sxfer allowed through its firewall (plus mDNS, UDP 5353)?",
             shown.join(", ")
         ),

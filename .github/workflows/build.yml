@@ -1,5 +1,5 @@
 name: build
-# Every push / PR: test on Linux, Windows, macOS, then build all six binaries as downloadable artifacts.
+# Every push / PR: test on Linux, Windows, macOS, then build sxfer + sxfer-mcp for all six targets as artifacts.
 # Tag vX.Y.Z: the same, plus a GitHub release with the binaries and SHA256SUMS.
 on:
   push:
@@ -28,9 +28,9 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
 
   build:
     name: build ${{ matrix.target }}
@@ -79,9 +79,11 @@ jobs:
           [ "$GITHUB_REF_TYPE" = tag ] || ver="$ver-${GITHUB_SHA::7}"
           ext=""; [[ "${{ matrix.target }}" == *windows* ]] && ext=.exe
           mkdir dist
-          out="dist/sxfer-$ver-${{ matrix.target }}$ext"
-          cp "target/${{ matrix.target }}/release/sxfer$ext" "$out"
-          echo "file=$out" >> "$GITHUB_OUTPUT"
+          for bin in sxfer sxfer-mcp; do
+            cp "target/${{ matrix.target }}/release/$bin$ext" "dist/$bin-$ver-${{ matrix.target }}$ext"
+          done
+          echo "file=dist/sxfer-$ver-${{ matrix.target }}$ext" >> "$GITHUB_OUTPUT"
+          echo "mcp=dist/sxfer-mcp-$ver-${{ matrix.target }}$ext" >> "$GITHUB_OUTPUT"
           ls -l dist
       - name: smoke test
         if: matrix.run
@@ -89,6 +91,8 @@ jobs:
         run: |
           "${{ steps.pkg.outputs.file }}" --version
           "${{ steps.pkg.outputs.file }}" --help >/dev/null
+          "${{ steps.pkg.outputs.mcp }}" --version
+          echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}'             | "${{ steps.pkg.outputs.mcp }}" | grep -q '"serverInfo"'
 
       - uses: actions/upload-artifact@v4
         with:

@@ -12,18 +12,22 @@ sxfer listen                      # prints a one-time code, e.g. 482-913
 sxfer listen --dir ~/Downloads    # choose where files land
 
 # sender (once per network)
-sxfer config add 192.168.2.0/24   # networks to search for listeners (IP or CIDR)
+sxfer config add 192.168.2.0/24   # networks you'll connect to (IP or CIDR) - an allowlist
 sxfer config list | remove <net>
 
 # sender
 sxfer send report.pdf             # finds the listener, asks for the code, sends, shreds
 sxfer send                        # no file: type a secret (hidden); shown once on the receiver, never saved
 echo "$OTP" | sxfer send          # secret from stdin
-sxfer send file --to 192.168.2.50 # skip discovery
+sxfer send file --to 192.168.2.50:51234   # skip discovery (the listener prints its port)
 ```
 
-Listeners use TCP and UDP port **47331** (`--port` on both sides to change it). On Windows, allow
-`sxfer.exe` through the firewall on the receiving machine the first time.
+There's no fixed port. The listener takes any free TCP port and advertises it over **Bonjour /
+mDNS** (`_sxfer._tcp.local.`); the sender browses for it and only connects to listeners whose
+address is inside a configured network, so a listener seen via a VPN, Docker bridge or guest
+network is ignored. No Bonjour/avahi install is needed (pure-Rust responder). The receiving
+machine's firewall must allow `sxfer` (on Windows, allow it when prompted) and mDNS (UDP 5353),
+which is usually already open on home networks.
 
 ## SSH: through your existing ssh setup
 

@@ -63,24 +63,20 @@ enum Cmd {
         /// Where received files are saved
         #[arg(long, default_value = ".")]
         dir: PathBuf,
-        #[arg(long, default_value_t = lan::PORT)]
-        port: u16,
     },
     /// Send a file over the LAN - or, with no FILE, a secret you type (shown once on the listener, never saved)
     Send {
         file: Option<PathBuf>,
-        /// Listener address or hostname (skips discovery)
+        /// Listener as host:port, as printed by `sxfer listen` (skips mDNS discovery)
         #[arg(long)]
         to: Option<String>,
-        #[arg(long, default_value_t = lan::PORT)]
-        port: u16,
         /// One-time code (otherwise you're asked for it)
         #[arg(long)]
         code: Option<String>,
         #[command(flatten)]
         shred: ShredOpts,
     },
-    /// Networks `send` searches for listeners
+    /// Networks `send` will connect to (an allowlist for discovered listeners)
     Config {
         #[command(subcommand)]
         action: ConfigCmd,
@@ -116,14 +112,13 @@ enum ConfigCmd {
 fn main() {
     let cli = Cli::parse();
     let r = match cli.cmd {
-        Cmd::Listen { dir, port } => listen(dir, port),
+        Cmd::Listen { dir } => listen(dir),
         Cmd::Send {
             file,
             to,
-            port,
             code,
             shred,
-        } => send(file, to, port, code, shred.cfg()),
+        } => send(file, to, code, shred.cfg()),
         Cmd::Config { action } => match action {
             ConfigCmd::Add { net } => config::add(&net),
             ConfigCmd::Remove { net } => config::remove(&net),
@@ -141,22 +136,23 @@ fn main() {
     }
 }
 
-fn listen(dir: PathBuf, port: u16) -> R<()> {
+fn listen(dir: PathBuf) -> R<()> {
     if !dir.is_dir() {
         crate::abort!("no such directory: {}", dir.display());
     }
     let code = lan::new_code();
     let shown_dir = std::fs::canonicalize(&dir).unwrap_or(dir.clone());
     let cfg = lan::ListenCfg {
-        bind: SocketAddr::from(([0, 0, 0, 0], port)),
+        bind: SocketAddr::from(([0, 0, 0, 0], 0)), // any free port; mDNS tells senders which
         dir,
+        advertise: true,
     };
     let got = lan::listen_core(&cfg, &code, &mut |p| {
         let ip = lan::primary_ip()
             .map(|i| i.to_string())
             .unwrap_or_else(|| "this machine".into());
         say(&format!(
-            "listening on {ip}:{p} as {}  (files -> {})",
+            "listening on {ip}:{p} as {}, advertised over mDNS  (files -> {})",
             host_name(),
             shown_dir.display()
         ));
@@ -195,13 +191,7 @@ fn listen(dir: PathBuf, port: u16) -> R<()> {
     Ok(())
 }
 
-fn send(
-    file: Option<PathBuf>,
-    to: Option<String>,
-    port: u16,
-    code: Option<String>,
-    sc: ShredCfg,
-) -> R<()> {
+fn send(file: Option<PathBuf>, to: Option<String>, code: Option<String>, sc: ShredCfg) -> R<()> {
     let payload = match file {
         Some(p) => {
             cloud_warning(&p);
@@ -224,8 +214,8 @@ fn send(
     };
 
     let addr = match to {
-        Some(t) => lan::resolve_to(&t, port)?,
-        None => pick_listener(port)?,
+        Some(t) => lan::resolve_to(&t)?,
+        None => pick_listener()?,
     };
     let code = match code {
         Some(c) => c,
@@ -245,33 +235,46 @@ fn send(
     Ok(())
 }
 
-fn pick_listener(port: u16) -> R<SocketAddr> {
+fn pick_listener() -> R<SocketAddr> {
     let nets = config::networks()?;
     if nets.is_empty() {
-        crate::abort!("no networks configured. Add yours first, e.g.: sxfer config add 192.168.2.0/24   (or use --to <ip>)");
+        crate::abort!(
+            "no networks configured. Add yours first, e.g.: sxfer config add 192.168.2.0/24   (or use --to <ip>:<port>)"
+        );
     }
     let shown: Vec<String> = nets.iter().map(|n| n.to_string()).collect();
-    say(&format!(
-        "looking for listeners on {} ...",
-        shown.join(", ")
-    ));
-    let found = lan::discover(&nets, port, Duration::from_millis(1500))?;
-    match found.len() {
+    say("looking for listeners (mDNS) ...");
+    let found = lan::discover(Duration::from_secs(2))?;
+    // allowlist: only listeners advertising an address inside a configured network
+    let ok: Vec<(String, SocketAddr)> = found
+        .iter()
+        .filter_map(|f| f.addr_in(&nets).map(|a| (f.name.clone(), a)))
+        .collect();
+    let ignored = found.len() - ok.len();
+    if ignored > 0 {
+        say(&format!(
+            "ignoring {ignored} listener(s) outside {}",
+            shown.join(", ")
+        ));
+    }
+    match ok.len() {
         0 => crate::abort!(
-            "no listener found on {}. Is `sxfer listen` running, and is port {port} (TCP+UDP) allowed through its firewall?",
+            "no listener found on {}. Is `sxfer listen` running on the same network, and is sxfer allowed through its firewall (plus mDNS, UDP 5353)?",
             shown.join(", ")
         ),
         1 => {
-            say(&format!("found {} at {}", found[0].name, found[0].addr));
-            Ok(found[0].addr)
+            say(&format!("found {} at {}", ok[0].0, ok[0].1));
+            Ok(ok[0].1)
         }
         _ => {
-            for (i, f) in found.iter().enumerate() {
-                eprintln!("  {}) {}  {}", i + 1, f.name, f.addr);
+            for (i, (name, addr)) in ok.iter().enumerate() {
+                eprintln!("  {}) {}  {}", i + 1, name, addr);
             }
             let a = prompt_line("sxfer: which one? ")?;
             let i: usize = a.parse().map_err(|_| Abort("not a number".into()))?;
-            found.get(i.wrapping_sub(1)).map(|f| f.addr).ok_or_else(|| Abort("no such listener".into()))
+            ok.get(i.wrapping_sub(1))
+                .map(|(_, a)| *a)
+                .ok_or_else(|| Abort("no such listener".into()))
         }
     }
 }

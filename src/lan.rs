@@ -1,7 +1,8 @@
 //! Direct LAN transfer, no SSH: `sxfer listen` on the receiver, `sxfer send` on the sender.
 //!
-//! DISCOVERY  sender sends a UDP probe "SXFER1?" to every host in its configured networks (plus
-//!            each network's broadcast address); listeners answer "SXFER1!" + {name, port, id}.
+//! DISCOVERY  Bonjour / mDNS DNS-SD. The listener binds a random free TCP port and advertises
+//!            `_sxfer._tcp.local.` (TXT: id, name); the sender browses for it and only connects to
+//!            listeners whose address is inside its configured networks (an allowlist).
 //! HANDSHAKE  TCP. SPAKE2 (Ed25519 group) keyed by the listener's one-time code: the code never
 //!            crosses the wire, an eavesdropper can't test guesses offline, and an active attacker
 //!            gets one guess per connection (the listener allows 3, then closes).
@@ -20,28 +21,25 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use hkdf::Hkdf;
 use ipnet::IpNet;
+use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Sha256;
 use spake2::{Ed25519Group, Identity, Password, Spake2};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub const PORT: u16 = 47331;
+const SERVICE: &str = "_sxfer._tcp.local.";
 const MAGIC: &[u8] = b"SXFER1";
-const PROBE: &[u8] = b"SXFER1?";
-const ANSWER: &[u8] = b"SXFER1!";
 const ID_SEND: &[u8] = b"sxfer-send";
 const ID_LISTEN: &[u8] = b"sxfer-listen";
 const MAX_FRAME: usize = 4 << 20;
 const MAX_TEXT: u64 = 64 * 1024;
-const MAX_HOSTS_PER_NET: usize = 4096;
 const MAX_BAD_CODES: u32 = 3;
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -206,28 +204,51 @@ pub enum Received {
 pub struct ListenCfg {
     pub bind: SocketAddr,
     pub dir: PathBuf,
+    /// advertise over mDNS (off in the tests)
+    pub advertise: bool,
 }
 
-/// Answer discovery probes until `stop` is set.
-fn spawn_responder(udp: UdpSocket, name: String, port: u16, id: String, stop: Arc<AtomicBool>) {
-    std::thread::spawn(move || {
-        let _ = udp.set_read_timeout(Some(Duration::from_millis(300)));
-        let mut buf = [0u8; 64];
-        let answer = [
-            ANSWER,
-            json!({"name": name, "port": port, "id": id})
-                .to_string()
-                .as_bytes(),
-        ]
-        .concat();
-        while !stop.load(Ordering::Relaxed) {
-            if let Ok((n, from)) = udp.recv_from(&mut buf) {
-                if &buf[..n] == PROBE {
-                    let _ = udp.send_to(&answer, from);
-                }
-            }
+/// An mDNS advertisement; dropping it sends the "goodbye" and stops the responder.
+struct Advert {
+    daemon: ServiceDaemon,
+    fullname: String,
+}
+
+impl Drop for Advert {
+    fn drop(&mut self) {
+        if let Ok(rx) = self.daemon.unregister(&self.fullname) {
+            let _ = rx.recv_timeout(Duration::from_millis(500));
         }
-    });
+        let _ = self.daemon.shutdown();
+    }
+}
+
+fn mdns_err(e: mdns_sd::Error) -> Abort {
+    Abort(format!("mDNS: {e}"))
+}
+
+fn advertise(port: u16) -> R<Advert> {
+    let daemon = ServiceDaemon::new().map_err(mdns_err)?;
+    let id = random_hex(4);
+    let name = host_name();
+    let props: HashMap<String, String> = [("id", id.as_str()), ("name", name.as_str()), ("v", "1")]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    // our own host label, so we never collide with the OS's own mDNS hostname
+    let info = ServiceInfo::new(
+        SERVICE,
+        &format!("{name}-{id}"),
+        &format!("sxfer-{id}.local."),
+        "",
+        port,
+        props,
+    )
+    .map_err(mdns_err)?
+    .enable_addr_auto();
+    let fullname = info.get_fullname().to_string();
+    daemon.register(info).map_err(mdns_err)?;
+    Ok(Advert { daemon, fullname })
 }
 
 /// Wait for one successful transfer with `code`. `ready` is called with the bound TCP port.
@@ -235,13 +256,20 @@ pub fn listen_core(cfg: &ListenCfg, code: &str, ready: &mut dyn FnMut(u16)) -> R
     let tcp = TcpListener::bind(cfg.bind)
         .map_err(|e| Abort(format!("cannot listen on {}: {e}", cfg.bind)))?;
     let port = tcp.local_addr()?.port();
-    let stop = Arc::new(AtomicBool::new(false));
-    match UdpSocket::bind(SocketAddr::new(cfg.bind.ip(), port)) {
-        Ok(udp) => spawn_responder(udp, host_name(), port, random_hex(4), stop.clone()),
-        Err(e) => say(&format!(
-            "discovery disabled (UDP {port}: {e}); senders must use --to"
-        )),
-    }
+    // held until we return; dropping it withdraws the advertisement
+    let _advert = if cfg.advertise {
+        match advertise(port) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                say(&format!(
+                    "{e}; not discoverable - senders must use --to <ip>:{port}"
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
     ready(port);
     let code = normalize_code(code);
     let mut bad = 0;
@@ -267,7 +295,6 @@ pub fn listen_core(cfg: &ListenCfg, code: &str, ready: &mut dyn FnMut(u16)) -> R
             Err(e) => say(&format!("{peer}: {e} (still listening)")),
         }
     };
-    stop.store(true, Ordering::Relaxed);
     result
 }
 
@@ -627,84 +654,76 @@ pub fn send_core(addr: SocketAddr, code: &str, payload: &Payload, sc: &ShredCfg)
 
 #[derive(Debug, Clone)]
 pub struct Found {
-    pub addr: SocketAddr,
+    pub addrs: Vec<IpAddr>,
+    pub port: u16,
     pub name: String,
     pub id: String,
 }
 
-pub fn discover(nets: &[IpNet], port: u16, wait: Duration) -> R<Vec<Found>> {
-    let udp = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
-    let _ = udp.set_broadcast(true);
-    for net in nets {
-        let IpNet::V4(n4) = net else {
-            say(&format!(
-                "skipping {net}: IPv6 discovery isn't supported (use --to)"
-            ));
-            continue;
-        };
-        let mut targets: Vec<IpAddr> = if n4.prefix_len() >= 31 {
-            vec![IpAddr::V4(n4.addr())]
-        } else {
-            n4.hosts().take(MAX_HOSTS_PER_NET).map(IpAddr::V4).collect()
-        };
-        if n4.prefix_len() < 31 {
-            targets.push(IpAddr::V4(n4.broadcast()));
-        }
-        if (1u64 << (32 - n4.prefix_len() as u32)) > MAX_HOSTS_PER_NET as u64 + 2 {
-            say(&format!(
-                "{net} is large; probing its first {MAX_HOSTS_PER_NET} hosts plus broadcast"
-            ));
-        }
-        for ip in targets {
-            let _ = udp.send_to(PROBE, SocketAddr::new(ip, port));
-        }
+impl Found {
+    /// The first advertised address inside one of `nets` (IPv4 preferred).
+    pub fn addr_in(&self, nets: &[IpNet]) -> Option<SocketAddr> {
+        let mut a: Vec<&IpAddr> = self
+            .addrs
+            .iter()
+            .filter(|ip| nets.iter().any(|n| n.contains(*ip)))
+            .collect();
+        a.sort_by_key(|ip| !ip.is_ipv4());
+        a.first().map(|ip| SocketAddr::new(**ip, self.port))
     }
+}
+
+/// Browse mDNS for `_sxfer._tcp` listeners for `wait`.
+pub fn discover(wait: Duration) -> R<Vec<Found>> {
+    let daemon = ServiceDaemon::new().map_err(mdns_err)?;
+    let rx = daemon.browse(SERVICE).map_err(mdns_err)?;
     let deadline = Instant::now() + wait;
     let mut found: Vec<Found> = Vec::new();
-    let mut buf = [0u8; 512];
     while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-        if left.is_zero() {
-            break;
-        }
-        let _ = udp.set_read_timeout(Some(left));
-        match udp.recv_from(&mut buf) {
-            Ok((n, from)) => {
-                if let Some(js) = buf[..n].strip_prefix(ANSWER) {
-                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(js) {
-                        let id = v["id"].as_str().unwrap_or("").to_string();
-                        if found.iter().any(|f| f.id == id) {
-                            continue; // same listener answering on another address
+        match rx.recv_timeout(left) {
+            Ok(ServiceEvent::ServiceResolved(info)) => {
+                let id = info
+                    .get_property_val_str("id")
+                    .unwrap_or_default()
+                    .to_string();
+                let addrs: Vec<IpAddr> = info
+                    .get_addresses()
+                    .iter()
+                    .map(|a| a.to_ip_addr())
+                    .collect();
+                if let Some(f) = found.iter_mut().find(|f| f.id == id) {
+                    for a in addrs {
+                        if !f.addrs.contains(&a) {
+                            f.addrs.push(a);
                         }
-                        let p = v["port"].as_u64().unwrap_or(port as u64) as u16;
-                        found.push(Found {
-                            addr: SocketAddr::new(from.ip(), p),
-                            name: v["name"].as_str().unwrap_or("?").to_string(),
-                            id,
-                        });
                     }
+                } else {
+                    found.push(Found {
+                        addrs,
+                        port: info.get_port(),
+                        name: info.get_property_val_str("name").unwrap_or("?").to_string(),
+                        id,
+                    });
                 }
             }
-            // Windows reports ICMP "port unreachable" from earlier probes as a reset here; ignore it
-            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
+            Ok(_) => {}
             Err(_) => break,
         }
     }
+    let _ = daemon.stop_browse(SERVICE);
+    let _ = daemon.shutdown();
     Ok(found)
 }
 
-pub fn resolve_to(to: &str, port: u16) -> R<SocketAddr> {
-    let with_port = if to.parse::<IpAddr>().is_ok() || !to.contains(':') {
-        format!("{to}:{port}")
-    } else {
-        to.to_string()
-    };
-    let with_port = if let Ok(IpAddr::V6(v6)) = to.parse::<IpAddr>() {
-        format!("[{v6}]:{port}")
-    } else {
-        with_port
-    };
-    with_port
-        .to_socket_addrs()
+/// `--to` takes host:port (the listener prints its port); there is no default port.
+pub fn resolve_to(to: &str) -> R<SocketAddr> {
+    if let Ok(a) = to.parse::<SocketAddr>() {
+        return Ok(a);
+    }
+    if to.parse::<IpAddr>().is_ok() || !to.contains(':') {
+        abort!("--to needs host:port, e.g. 192.168.2.50:51234 (the listener shows its port)");
+    }
+    to.to_socket_addrs()
         .map_err(|e| Abort(format!("cannot resolve {to}: {e}")))?
         .next()
         .ok_or_else(|| Abort(format!("cannot resolve {to}")))
@@ -746,6 +765,7 @@ mod tests {
             let cfg = ListenCfg {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 dir,
+                advertise: false,
             };
             listen_core(&cfg, code, &mut |p| tx.send(p).unwrap())
         });
@@ -864,17 +884,47 @@ mod tests {
         assert_eq!(fs::read(dst_dir.join("x.txt")).unwrap(), b"old");
     }
 
+    /// Real multicast on this machine's interfaces: run with `cargo test -- --ignored`.
     #[test]
-    fn discovery_finds_listener() {
-        let (port, _h) = start_listener(tmpdir("dst"), "777-777");
-        let found = discover(
-            &["127.0.0.1/32".parse().unwrap()],
-            port,
-            Duration::from_millis(800),
-        )
-        .unwrap();
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].addr.port(), port);
+    #[ignore]
+    fn mdns_discovery_finds_listener() {
+        std::env::set_var("SXFER_HOME", std::env::temp_dir().join("sxfer-test-home"));
+        let (tx, rx) = mpsc::channel();
+        let dir = tmpdir("dst");
+        std::thread::spawn(move || {
+            let cfg = ListenCfg {
+                bind: "0.0.0.0:0".parse().unwrap(),
+                dir,
+                advertise: true,
+            };
+            listen_core(&cfg, "777-777", &mut |p| tx.send(p).unwrap())
+        });
+        let port = rx.recv().unwrap();
+        let found = discover(Duration::from_secs(3)).unwrap();
+        let me = found.iter().find(|f| f.port == port);
+        assert!(
+            me.is_some(),
+            "listener on port {port} not found in {found:?}"
+        );
+        assert!(!me.unwrap().addrs.is_empty());
+    }
+
+    #[test]
+    fn allowlist_picks_address_inside_configured_networks() {
+        let f = Found {
+            addrs: vec![
+                "fe80::1".parse().unwrap(),
+                "172.17.0.1".parse().unwrap(),
+                "192.168.2.50".parse().unwrap(),
+            ],
+            port: 50123,
+            name: "x".into(),
+            id: "1".into(),
+        };
+        let lan: Vec<IpNet> = vec!["192.168.2.0/24".parse().unwrap()];
+        assert_eq!(f.addr_in(&lan), Some("192.168.2.50:50123".parse().unwrap()));
+        let other: Vec<IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+        assert_eq!(f.addr_in(&other), None);
     }
 
     #[test]

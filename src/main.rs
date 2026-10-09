@@ -300,9 +300,15 @@ mod tests {
     #[test]
     fn flags_override_configured_confirmation() {
         assert!(resolve_ask(false, false, true), "default config asks");
-        assert!(!resolve_ask(false, false, false), "config off shreds without asking");
+        assert!(
+            !resolve_ask(false, false, false),
+            "config off shreds without asking"
+        );
         assert!(!resolve_ask(true, false, true), "-y skips the prompt");
-        assert!(resolve_ask(false, true, false), "--ask asks despite config off");
+        assert!(
+            resolve_ask(false, true, false),
+            "--ask asks despite config off"
+        );
     }
 
     #[test]

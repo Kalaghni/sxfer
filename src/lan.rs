@@ -1083,8 +1083,15 @@ mod tests {
         }
     }
 
+    /// Point ~/.sxfer at a test directory. Every helper that leads to the trust store calls this
+    /// first, so no test (whatever order they run in) touches the real one.
+    fn test_home() {
+        std::env::set_var("SXFER_HOME", std::env::temp_dir().join("sxfer-test-home"));
+    }
+
     /// A fresh identity with a unique name, so tests sharing the trust store don't collide.
     fn ident(role: &str) -> id::Identity {
+        test_home();
         id::Identity::from_seed(&id::new_seed(), &format!("{role}-{}", random_hex(4)))
     }
 
@@ -1092,7 +1099,7 @@ mod tests {
     static PINNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn listen_cfg(dir: PathBuf, me: id::Identity) -> ListenCfg {
-        std::env::set_var("SXFER_HOME", std::env::temp_dir().join("sxfer-test-home"));
+        test_home();
         ListenCfg {
             bind: "127.0.0.1:0".parse().unwrap(),
             dir,

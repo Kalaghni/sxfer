@@ -32,6 +32,27 @@ macro_rules! abort {
     ($($t:tt)*) => { return Err($crate::common::Abort(format!($($t)*))) };
 }
 
+/// Stack for threads that touch ML-DSA keys: they're large, debug builds keep them on the stack,
+/// and Windows gives the main thread only 1 MiB.
+pub const STACK: usize = 16 << 20;
+
+pub fn spawn_big<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> std::thread::JoinHandle<T> {
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(f)
+        .expect("cannot start a thread")
+}
+
+/// Run `f` on a thread with a `STACK`-sized stack and wait for it.
+pub fn with_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    match spawn_big(f).join() {
+        Ok(v) => v,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
 pub fn say(msg: &str) {
     eprintln!("sxfer: {msg}");
 }
@@ -60,6 +81,16 @@ impl ShredCfg {
 
 pub fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+pub fn unhex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
 }
 
 pub fn random_hex(nbytes: usize) -> String {

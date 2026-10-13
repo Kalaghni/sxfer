@@ -3,5 +3,6 @@
 
 pub mod common;
 pub mod config;
+pub mod identity;
 pub mod lan;
 pub mod ssh;

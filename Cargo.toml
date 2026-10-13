@@ -1,6 +1,6 @@
 [package]
 name = "sxfer"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "Move a file or a secret between machines: encrypted, proven receipt, then shred the source."
 license = "MIT"
@@ -8,7 +8,7 @@ repository = "https://github.com/Kalaghni/sxfer"
 readme = "README.md"
 keywords = ["file-transfer", "spake2", "shred", "mdns", "secure"]
 categories = ["command-line-utilities", "cryptography"]
-rust-version = "1.80"
+rust-version = "1.85"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -24,6 +24,10 @@ hostname = "0.4"
 rpassword = "7"
 dirs = "5"
 mdns-sd = "0.21.5"
+ml-dsa = "0.1.1"
+ml-kem = { version = "0.3.2", features = ["getrandom"] }
+getrandom = { version = "0.4.3", features = ["sys_rng"] }
+spki = { version = "0.8.1", features = ["pem"] }
 
 [workspace]
 members = ["sxfer-mcp"]

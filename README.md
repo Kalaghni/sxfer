@@ -4,7 +4,8 @@
 
 Move a file - or a secret like a password or OTP - from one machine to another: encrypted in
 transit, receipt proven against the receiver's disk, then (once you say yes) the source is
-shredded. One static binary, no runtime dependencies.
+shredded. One static binary, no runtime dependencies. LAN transfers are post-quantum: ML-KEM-768
+key exchange, ML-DSA-65 signed peers and receipts.
 
 ## LAN: direct, paired by a one-time code
 
@@ -22,7 +23,31 @@ sxfer send report.pdf             # finds the listener, asks for the code, sends
 sxfer send                        # no file: type a secret (hidden); shown once on the receiver, never saved
 echo "$OTP" | sxfer send          # secret from stdin
 sxfer send file --to 192.168.2.50:51234   # skip discovery (the listener prints its port)
+sxfer send file --receipt r.json  # keep the listener's signed receipt (`sxfer receipt verify r.json`)
 ```
+
+### Pinned peers: skip the code between your own machines
+
+Every machine has a post-quantum identity (an ML-DSA-65 key, made on first use). Pin each other once
+and they can pair without a code, like ssh `known_hosts`:
+
+```
+sxfer id                                   # this machine's name and fingerprint
+sxfer listen --remember                    # after a transfer with the code, pin the sender
+sxfer send report.pdf --remember           # ... and the sender pins the listener
+sxfer trust add laptop 3f2a-91c0-...       # or pin by fingerprint, compared in person or by phone
+sxfer trust list | remove <name>
+
+sxfer listen --trusted                     # also accept pinned senders without the code
+sxfer send report.pdf                      # a pinned --trusted listener: no code asked
+sxfer send report.pdf --to 10.8.0.2:51234 --no-code   # same over a VPN (no mDNS there)
+```
+
+A pinned name that shows up with a different key is refused, even with the right code
+(`KEY CHANGED`). If that machine was reinstalled, `sxfer trust remove <name>` and pair once with a
+code.
+
+LAN mode in sxfer 0.7 speaks protocol v2: both sides need 0.7 or later.
 
 There's no fixed port. The listener takes any free TCP port and advertises it over **Bonjour /
 mDNS** (`_sxfer._tcp.local.`); the sender browses for it and only connects to listeners whose
@@ -58,6 +83,9 @@ claude mcp add sxfer -- sxfer-mcp          # Claude Code; other clients: command
 | `start_listener` / `listener_status` / `stop_listener` | receive one file in the background; returns the code for the sender |
 | `discover_listeners`, `get_config` | read-only |
 
+Results name the peer it paired with (ML-DSA-65 fingerprint, pinned or not); `send_file` can skip
+the code for a receiver you pinned that runs `--trusted`, and `start_listener` takes `trusted`.
+
 Rules that hold whatever the model asks:
 
 - **You decide on every shred, not the model.** Once the receiver's copy is verified, the server asks
@@ -66,7 +94,8 @@ Rules that hold whatever the model asks:
   within 9 minutes. No tool takes a "yes"/"confirm" argument; `sxfer config confirm` doesn't apply.
 - **Files only.** Secrets would land in the model's context and the transcript, so there's no tool
   for them, and a listener started over MCP refuses them. Use `sxfer send` for passwords and OTPs.
-- **The network allowlist is yours.** The server reads `sxfer config` but can't change it.
+- **The network allowlist and pinned peers are yours.** The server reads `sxfer config` and
+  `sxfer trust` but can't change them.
 - Paths must be absolute. SSH runs with `BatchMode=yes`: key or agent auth only, no prompts.
 
 ## Options (send / push / pull)
@@ -102,8 +131,10 @@ send / push / pull. `-y` and `--ask` override it for one run.
    identical file (an earlier run whose receipt got lost), it counts as delivered.
 5. **Shred** the source, once confirmed: N random passes + zeros, fsync each, truncate, rename,
    unlink.
-6. **Receipt** - logged on the **destination only** (`~/.sxfer/receipts.jsonl`). The source keeps no
-   record of what it shredded.
+6. **Receipt** - on the LAN the listener signs it (ML-DSA-65, bound to this session) and the sender
+   checks the signature *before* step 5. It's logged on the **destination only**
+   (`~/.sxfer/receipts.jsonl`); the source keeps no record of what it shredded unless you ask for
+   the signed receipt with `send --receipt`.
 
 Any failure before step 5 deletes the partial copy and leaves the source untouched; just rerun.
 SSH mode uses keepalives and a hang-up-proof remote shred, so a dropped connection is detected in
@@ -114,9 +145,24 @@ about 30 s and never interrupts a shred halfway.
 - **SPAKE2** (Ed25519 group) turns the 6-digit code into a strong shared key. The code never crosses
   the network, an eavesdropper can't test guesses offline, and an active attacker gets one guess per
   connection. The listener closes after 3 wrong codes (odds of guessing: 3 in a million).
-- **ChaCha20-Poly1305** with HKDF-SHA256-derived keys, one per direction, counter nonces.
+- **ML-KEM-768** (FIPS 203) runs alongside it in the same round trip, with a fresh key per
+  connection. The session key needs both secrets, so recording a transfer today and breaking
+  SPAKE2's elliptic curve with a quantum computer later doesn't decrypt it.
+- **ML-DSA-65** (FIPS 204) identities: inside the encrypted channel each side signs the handshake
+  transcript, and pinned peers are checked like ssh host keys. Without a code (pinned peers,
+  `--trusted`) these signatures are what authenticates the pairing.
+- **Signed receipts**: the listener signs what it committed (name, size, SHA-256, path, both
+  fingerprints, the session hash). The sender won't shred until that verifies, and a saved receipt
+  verifies offline with `sxfer receipt verify r.json [--file report.pdf]`.
+- **ChaCha20-Poly1305** with keys from HKDF-SHA256 over both shared secrets, salted with the
+  transcript hash; one key per direction, counter nonces.
 - File names from the sender are reduced to a bare name (no paths, no `..`).
 - Secrets are capped at 64 KiB, shown once on the receiver's terminal, and never written to disk.
+
+What isn't post-quantum: **SSH mode** inherits your OpenSSH's key exchange (OpenSSH 9.0+ defaults to
+the hybrid `sntrup761x25519`, 9.9+ to `mlkem768x25519`) and its host keys, and has no signed
+receipts, since the remote side runs only `sh`. **Discovery** is plain mDNS; the fingerprint a
+listener advertises only decides whether to ask for a code, and is checked once paired.
 
 ### Shredding caveat
 
@@ -138,10 +184,35 @@ built on that library.
 Every push and pull request runs `.github/workflows/build.yml`: fmt, clippy and tests on Linux,
 Windows and macOS, then native builds of both binaries for Linux (x86-64, ARM64, static), Windows
 (x86-64, ARM64) and macOS (Intel, Apple Silicon), uploaded as workflow artifacts. Tagging `vX.Y.Z` also publishes
-them to a GitHub release with `SHA256SUMS`.
+them to a GitHub release with `SHA256SUMS` and its ML-DSA-65 signature `SHA256SUMS.sig`.
+
+### Release signing (maintainers, once)
+
+```
+sxfer sig keygen release.key        # secret seed + release.key.pub.pem; generate it on a machine you trust
+```
+
+1. Add the contents of `release.key` as the repository secret `SXFER_RELEASE_KEY`, then move the
+   file somewhere offline. Never commit it.
+2. Commit `release.key.pub.pem` as `release.pub.pem` in the repo root.
+
+The release job signs `SHA256SUMS`, checks the signature against `release.pub.pem`, and publishes
+nothing if that check fails. Without the secret, releases are published unsigned, with a warning.
 
 ## Download
 
 Grab a binary from [Releases](https://github.com/Kalaghni/sxfer/releases), or the artifacts of the
 latest [build run](https://github.com/Kalaghni/sxfer/actions). Check it against `SHA256SUMS`, then
 put it on your PATH. On macOS, a downloaded binary may need `xattr -d com.apple.quarantine sxfer`.
+
+### Verifying a download
+
+Releases from 0.7 on carry `SHA256SUMS.sig`, a post-quantum (ML-DSA-65) signature by the key in
+`release.pub.pem` (repo root, once the maintainer has set it up). Check it with OpenSSL 3.5 or
+later, which needs no trust in sxfer itself, or with an sxfer you already trust:
+
+```
+openssl pkeyutl -verify -pubin -inkey release.pub.pem -rawin -in SHA256SUMS -sigfile SHA256SUMS.sig
+sxfer sig verify SHA256SUMS --pubkey release.pub.pem
+sha256sum -c SHA256SUMS --ignore-missing
+```

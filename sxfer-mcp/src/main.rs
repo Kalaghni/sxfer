@@ -7,7 +7,8 @@
 //!            or anything but an explicit yes keeps the source. `sxfer config confirm` is ignored.
 //!   FILES    only. A secret would end up in the model's context and transcript, so there is no
 //!            way to send one, and a listener started here refuses them.
-//!   NETWORKS the allowlist (`sxfer config add`) is read here, never changed.
+//!   NETWORKS the allowlist (`sxfer config add`) and the pinned peers (`sxfer trust`) are read
+//!            here, never changed.
 //!
 //! stdout carries JSON-RPC only; progress goes to stderr, as with the CLI.
 
@@ -23,7 +24,9 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sxfer::abort;
-use sxfer::common::{cloud_markers, host_name, sxfer_dir, Abort, Asker, ShredCfg, R};
+use sxfer::common::{cloud_markers, host_name, spawn_big, sxfer_dir, with_big_stack};
+use sxfer::common::{Abort, Asker, ShredCfg, R};
+use sxfer::identity::{self as id, Identity};
 use sxfer::{config, lan, ssh};
 
 /// Newest first. A client asking for one we don't know gets the newest.
@@ -44,10 +47,13 @@ delete or overwrite a source some other way.
 - Files only. Passwords, OTPs and other secrets can't be sent or received here; point the user \
 to the sxfer CLI (`sxfer send` with no file) for those.
 - A LAN send needs the 6-digit code shown on the receiving machine. Ask the user for it; never \
-guess (3 wrong codes close the listener).
+guess (3 wrong codes close the listener). The exception: a receiver the user has pinned, started \
+with --trusted, pairs without a code.
+- Transfers are post-quantum: ML-KEM-768 joins the code's key exchange, and both machines and the \
+receipt are signed with ML-DSA-65. Report the peer's name and fingerprint from the result.
 - Paths must be absolute.
-- The network allowlist belongs to the user (`sxfer config add <cidr>`). You can read it with \
-get_config but not change it.";
+- The network allowlist (`sxfer config add <cidr>`) and pinned peers (`sxfer trust`) belong to \
+the user. You can read them with get_config but not change them.";
 
 const SHRED_NOTE: &str = "\
 The file was delivered and the receiver's copy verified. Shredding overwrites and deletes the \
@@ -312,23 +318,36 @@ impl Server {
 
     fn send_file(&self, args: &Value) -> R<Value> {
         let path = path_arg(args, "path")?;
-        let code = text_arg(args, "code")?;
-        if lan::normalize_code(code).len() != 6 {
-            abort!("the code is 6 digits, like 482-913");
-        }
         let sc = self.shred_cfg(args)?;
         let cloud = warnings(&path);
-        let addr = match args["to"].as_str() {
-            Some(to) => lan::resolve_to(to)?,
-            None => pick_listener()?,
+        let (addr, found) = match args["to"].as_str() {
+            Some(to) => (lan::resolve_to(to)?, None),
+            None => {
+                let (addr, f) = pick_listener()?;
+                (addr, Some(f))
+            }
+        };
+        let auth = match args["code"].as_str() {
+            Some(code) if lan::normalize_code(code).len() == 6 => lan::Auth::Code(code.into()),
+            Some(_) => abort!("the code is 6 digits, like 482-913"),
+            None if found.as_ref().is_some_and(|f| f.trusted_and_pinned()) => lan::Auth::Trusted,
+            None => abort!("this receiver needs its one-time code: ask the user for it"),
+        };
+        let me = Identity::load_or_create()?;
+        let opts = lan::SendOpts {
+            auth,
+            me: &me,
+            remember: false,
         };
         let payload = lan::Payload::File(path.clone());
-        let sent = lan::send_core(addr, code, &payload, &sc)?;
+        let sent = lan::send_core(addr, &payload, &sc, &opts)?;
         Ok(json!({
             "sent": path.display().to_string(),
             "to": addr.to_string(),
+            "receiver": peer(&sent.listener),
             "saved_as": sent.dest_path,
             "already_there": sent.already,
+            "receipt": "signed by the receiver (ML-DSA-65) and verified before any shred",
             "shredded": sent.shredded,
             "kept_because": self.kept(&sc, sent.shredded),
             "warnings": cloud
@@ -384,16 +403,21 @@ impl Server {
         let code = lan::new_code();
         let stop = Arc::new(AtomicBool::new(false));
         let done = Arc::new(Mutex::new(None));
+        let me = Arc::new(Identity::load_or_create()?);
+        let trusted = flag(args, "trusted");
         let cfg = lan::ListenCfg {
             bind: SocketAddr::from(([0, 0, 0, 0], 0)), // any free port; mDNS tells senders which
             dir: dir.clone(),
             advertise: true,
             accept_text: false,
             stop: Some(Arc::clone(&stop)),
+            me: Arc::clone(&me),
+            trusted,
+            remember: false, // pinning is the user's call: `sxfer trust`
         };
         let (port_tx, port_rx) = mpsc::channel();
         let (thread_code, thread_done) = (code.clone(), Arc::clone(&done));
-        std::thread::spawn(move || {
+        spawn_big(move || {
             let got = lan::listen_core(&cfg, &thread_code, &mut |p| {
                 let _ = port_tx.send(p);
             });
@@ -419,6 +443,8 @@ impl Server {
             "port": port,
             "address": ip,
             "host": host_name(),
+            "fingerprint": me.fingerprint(),
+            "pinned_senders_skip_code": trusted,
             "saving_to": dir.display().to_string(),
             "next": NEXT_STEPS
         }))
@@ -450,6 +476,16 @@ impl Server {
     }
 }
 
+/// A peer that proved its key during the handshake.
+fn peer(p: &lan::PeerInfo) -> Value {
+    json!({
+        "name": p.name,
+        "fingerprint": p.fingerprint,
+        "short": id::short_fp(&p.fingerprint),
+        "pinned": p.known
+    })
+}
+
 /// What a finished listener got.
 fn received(r: &lan::Received) -> Value {
     match r {
@@ -457,13 +493,16 @@ fn received(r: &lan::Received) -> Value {
             path,
             already,
             shredded,
+            sender,
         } => {
             let path = path.display().to_string();
             json!({
                 "status": "received",
                 "path": path,
+                "from": peer(sender),
                 "already_had_it": already,
-                "sender_shredded": shredded
+                "sender_shredded": shredded,
+                "receipt": "signed with this machine's ML-DSA-65 key and logged in ~/.sxfer/receipts.jsonl"
             })
         }
         // can't happen: the listener refuses secrets, and the text is never returned anyway
@@ -474,7 +513,14 @@ fn received(r: &lan::Received) -> Value {
 fn get_config() -> R<Value> {
     let c = config::load();
     let cli_confirm = c.confirm_shred();
+    let me = Identity::load_or_create()?;
+    let pinned: Vec<Value> = id::peers()
+        .iter()
+        .map(|p| json!({ "name": p.name, "fingerprint": p.fingerprint }))
+        .collect();
     Ok(json!({
+        "identity": { "name": me.name, "fingerprint": me.fingerprint(), "algorithm": "ML-DSA-65" },
+        "pinned_peers": pinned,
         "networks": c.networks,
         "cli_confirm_shred": cli_confirm,
         "mcp_shredding": "always asks the user first; the CLI confirm setting doesn't apply here",
@@ -496,7 +542,10 @@ fn discover_listeners(args: &Value) -> R<Value> {
                 "name": f.name,
                 "addresses": addresses,
                 "port": f.port,
-                "to": to
+                "to": to,
+                "fingerprint": f.fingerprint,
+                "pairs_without_code": f.trusted_and_pinned(),
+                "compatible": f.version == "2"
             })
         })
         .collect();
@@ -508,16 +557,20 @@ fn discover_listeners(args: &Value) -> R<Value> {
     }))
 }
 
-/// The one discovered listener inside the configured networks.
-fn pick_listener() -> R<SocketAddr> {
+/// The one discovered (0.7+) listener inside the configured networks.
+fn pick_listener() -> R<(SocketAddr, lan::Found)> {
     let nets = config::networks()?;
     if nets.is_empty() {
         abort!("no networks configured: the user runs `sxfer config add <cidr>`, or pass `to`");
     }
     let found = lan::discover(DISCOVER_WAIT)?;
-    let ok: Vec<SocketAddr> = found.iter().filter_map(|f| f.addr_in(&nets)).collect();
+    let mut ok: Vec<(SocketAddr, lan::Found)> = found
+        .iter()
+        .filter(|f| f.version == "2")
+        .filter_map(|f| f.addr_in(&nets).map(|a| (a, f.clone())))
+        .collect();
     match ok.as_slice() {
-        [one] => Ok(*one),
+        [_] => Ok(ok.remove(0)),
         [] => abort!("no listener found on the configured networks; pass `to` as ip:port"),
         _ => abort!(
             "{} listeners found; ask the user which, then pass `to`",
@@ -582,7 +635,7 @@ to shred the source; you can't answer that question, and anything but their yes 
     json!([
         {
             "name": "get_config",
-            "description": "Show sxfer's settings on this machine: the networks LAN sends may connect to, and the config file's location.",
+            "description": "Show sxfer's settings on this machine: its ML-DSA-65 identity fingerprint, pinned peers, the networks LAN sends may connect to, and the config file's location.",
             "inputSchema": { "type": "object", "properties": {} },
             "annotations": { "title": "sxfer settings", "readOnlyHint": true, "openWorldHint": false }
         },
@@ -599,17 +652,17 @@ to shred the source; you can't answer that question, and anything but their yes 
         },
         {
             "name": "send_file",
-            "description": format!("Send a file directly to a machine running `sxfer listen`, paired by the 6-digit code shown there. Without `to`, finds the one receiver on the configured networks. {shred_rule}"),
+            "description": format!("Send a file directly to a machine running `sxfer listen` (0.7+), paired by the 6-digit code shown there, or without a code if the user pinned that receiver and it runs --trusted. Post-quantum: ML-KEM-768 + ML-DSA-65 signed handshake and receipt. Without `to`, finds the one receiver on the configured networks. {shred_rule}"),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Absolute path of the file to send." },
-                    "code": { "type": "string", "description": "The one-time code the receiver shows, e.g. 482-913. Ask the user; never guess." },
+                    "code": { "type": "string", "description": "The one-time code the receiver shows, e.g. 482-913. Ask the user; never guess. Omit only for a pinned --trusted receiver." },
                     "to": { "type": "string", "description": "Receiver as ip:port (it prints its port). Needed over VPNs, WireGuard, or when several receivers are found." },
                     "keep": keep,
                     "passes": passes
                 },
-                "required": ["path", "code"]
+                "required": ["path"]
             },
             "annotations": { "title": "Send a file (LAN)", "readOnlyHint": false, "destructiveHint": true, "openWorldHint": true }
         },
@@ -645,11 +698,12 @@ to shred the source; you can't answer that question, and anything but their yes 
         },
         {
             "name": "start_listener",
-            "description": "Receive one file on this machine: opens a listener in the background and returns its one-time code for the sender. Refuses secrets. Check listener_status afterwards.",
+            "description": "Receive one file on this machine: opens a listener in the background and returns its one-time code for the sender, plus this machine's ML-DSA-65 fingerprint. Refuses secrets. Check listener_status afterwards.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "dir": { "type": "string", "description": "Absolute path of the folder received files are saved in." }
+                    "dir": { "type": "string", "description": "Absolute path of the folder received files are saved in." },
+                    "trusted": { "type": "boolean", "description": "Also accept senders the user has pinned (`sxfer trust`) without the code." }
                 },
                 "required": ["dir"]
             },
@@ -671,6 +725,10 @@ to shred the source; you can't answer that question, and anything but their yes 
 }
 
 fn main() {
+    with_big_stack(run)
+}
+
+fn run() {
     match std::env::args().nth(1).as_deref() {
         Some("--version" | "-V") => {
             println!("sxfer-mcp {}", env!("CARGO_PKG_VERSION"));

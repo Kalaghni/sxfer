@@ -1,6 +1,7 @@
 name: build
 # Every push / PR: test on Linux, Windows, macOS, then build sxfer + sxfer-mcp for all six targets as artifacts.
-# Tag vX.Y.Z: the same, plus a GitHub release with the binaries and SHA256SUMS.
+# Tag vX.Y.Z: the same, plus a GitHub release with the binaries, SHA256SUMS and, once the
+# SXFER_RELEASE_KEY secret exists, SHA256SUMS.sig (ML-DSA-65; see README "Verifying a download").
 on:
   push:
     branches: [main]
@@ -105,11 +106,28 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4 # for release.pub.pem
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
       - run: cd dist && sha256sum sxfer-* > SHA256SUMS && cat SHA256SUMS
+      - name: sign SHA256SUMS (ML-DSA-65)
+        env:
+          SXFER_RELEASE_KEY: ${{ secrets.SXFER_RELEASE_KEY }}
+        run: |
+          if [ -z "$SXFER_RELEASE_KEY" ]; then
+            echo "::warning::no SXFER_RELEASE_KEY secret: this release is not signed (see README)"
+            exit 0
+          fi
+          tool=$(ls dist/sxfer-[0-9]*-x86_64-unknown-linux-musl)
+          chmod +x "$tool"
+          key=$(mktemp)
+          echo "$SXFER_RELEASE_KEY" > "$key"
+          "$tool" sig sign dist/SHA256SUMS --key "$key"
+          rm -f "$key"
+          # the signature must check out against the public key in the repo, or nothing is published
+          "$tool" sig verify dist/SHA256SUMS --pubkey release.pub.pem
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*

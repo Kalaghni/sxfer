@@ -7,6 +7,10 @@ transit, receipt proven against the receiver's disk, then (once you say yes) the
 shredded. One static binary, no runtime dependencies. LAN transfers are post-quantum: ML-KEM-768
 key exchange, ML-DSA-65 signed peers and receipts.
 
+The same channel carries **messages between AI agents**: `sxfer serve` keeps an always-on inbox
+that only your pinned machines can write to, runs your agent when something arrives, and sends
+replies back along the same thread. No server, no account, no cloud: [agent messaging](#agent-messaging-an-encrypted-mailbox-between-your-machines).
+
 ## LAN: direct, paired by a one-time code
 
 ```
@@ -47,7 +51,7 @@ A pinned name that shows up with a different key is refused, even with the right
 (`KEY CHANGED`). If that machine was reinstalled, `sxfer trust remove <name>` and pair once with a
 code.
 
-LAN mode in sxfer 0.7 speaks protocol v2: both sides need 0.7 or later.
+LAN mode in sxfer 0.7 speaks protocol v2: both sides need 0.7 or later (0.8 for agent messages).
 
 There's no fixed port. The listener takes any free TCP port and advertises it over **Bonjour /
 mDNS** (`_sxfer._tcp.local.`); the sender browses for it and only connects to listeners whose
@@ -66,6 +70,105 @@ sxfer pull myserver:/root/secrets.txt .   # fetch, verify, confirm, shred the re
 Uses your `ssh` client and `~/.ssh/config` (aliases, keys, agents). The remote side needs only
 `sh`, coreutils `sha256sum` and `shred`.
 
+## Agent messaging: an encrypted mailbox between your machines
+
+Agents on different machines hand work to each other: a markdown handoff, a request, a result,
+with files attached. Each machine runs `sxfer serve`; messages travel over the LAN protocol above,
+between **pinned peers only**, and land in the receiver's inbox, where a command you choose
+(your agent) picks them up.
+
+```
+# once, on each machine: pin the other (or `listen --remember` / `send --remember` once)
+sxfer trust add build-box 3f2a-91c0-...
+
+# the receiver: an inbox that runs your agent for each message
+sxfer serve --on-receive ./agent-hook.sh
+
+# the sender
+sxfer msg send build-box handoff.md -s "Review PR 7" -i handoff -a ci.log
+sxfer msg send build-box - -i request < todo.md           # body from stdin
+sxfer msg send build-box --data '{"pr": 7}' -i request    # structured data, no body
+sxfer msg send build-box handoff.md --move                # hand it over: shred it once delivered (asks first; -y doesn't)
+```
+
+On the receiving side:
+
+```
+sxfer inbox list                  # waiting messages, oldest first (--all: handled ones too)
+sxfer inbox read 9496             # verified sender, subject, intent, thread, then the content
+sxfer inbox wait --timeout 600    # block until one arrives (exit 2 on timeout)
+sxfer inbox save 9496 --dir .     # write its attachments out
+sxfer msg reply 9496 --done < answer.md   # back to the sender, same thread; file the original
+sxfer inbox done 9496
+```
+
+`--json` on `msg send|reply` and `inbox list|read|wait` gives machine-readable output.
+
+### Running an agent on each message
+
+`--on-receive` runs once per new message (`sh -c`, or `cmd /C` on Windows) with these set:
+`SXFER_MSG_ID`, `SXFER_MSG` (the entry's path), `SXFER_FROM`, `SXFER_FROM_FP`, `SXFER_INTENT`,
+`SXFER_SUBJECT`, `SXFER_THREAD`, `SXFER_HOP`, `SXFER_INBOX`. Exit 0 moves the message to
+`done/`; anything else leaves it waiting, with the output in `<inbox>/logs/`. `--jobs N` runs
+several at once (default 1); `--replay` also runs it for messages that were waiting at startup.
+
+With Claude Code, for example (`agent-hook.sh`):
+
+```sh
+#!/bin/sh
+sxfer inbox read "$SXFER_MSG_ID" | claude -p "Another agent sent you the message above; its \
+sender is verified. Handle it, then answer with: sxfer msg reply $SXFER_MSG_ID --done (your \
+answer on stdin)." --allowedTools "Bash(sxfer msg reply:*)" Read Edit
+```
+
+An agent that's already running can wait instead: `sxfer inbox wait` in a loop, or the MCP
+server's `inbox_wait`.
+
+### What's guaranteed
+
+| | |
+|---|---|
+| **Who sent it** | The inbox entry's `from` is the key that signed the handshake, named as *you* pinned it - never what the message says about itself. Replies go back to that key. |
+| **Who gets it** | The sender names the peer; whoever answers at that address must prove it holds that peer's pinned key before a byte of the message is sent. |
+| **Delivered, once** | The receiver stores the message, reads it back from disk, then signs a receipt the sender verifies. Resending the same message (a lost receipt, a retry) is acknowledged again but never stored or run twice. |
+| **Not lost** | A peer that can't be reached gets the message later: it waits in `~/.sxfer/outbox/`, retried by `sxfer serve` with backoff (30 s, doubling to 30 min) for a week. `sxfer msg outbox` shows it, `sxfer msg flush` retries now, `--no-queue` fails instead. |
+| **No runaway agents** | Every reply is one hop further; past `--max-hops` (default 8) the receiver refuses it. Each sender gets `--rate` messages a minute (default 30). Messages are capped at 16 MiB. |
+| **No secrets** | `serve` refuses secrets (`sxfer send` with no file): they'd end up in an agent's context. |
+
+### Across a VPN, and other options
+
+mDNS doesn't cross VPNs or WireGuard. There, give the peer a fixed address and skip
+advertising:
+
+```
+sxfer serve --bind 10.8.0.2 --port 47100 --no-mdns    # on build-box
+sxfer trust addr build-box 10.8.0.2:47100             # on the sender (no address: mDNS again)
+```
+
+Without `--port`, `serve` reuses the port it had last time, so replies keep finding it after a
+restart. `--files DIR` also takes ordinary files from pinned peers (`sxfer send --no-code`), saved in
+DIR. `sxfer msg peers` lists your pinned peers and whether their `serve` is seen on this network.
+
+### Message format
+
+Messages are [A2A](https://a2a-protocol.org) (Agent2Agent) Message objects, so agents that speak
+A2A read them as is:
+
+```json
+{
+  "kind": "message", "messageId": "9496...", "role": "agent", "contextId": "f449...",
+  "parts": [
+    { "kind": "text", "text": "# Handoff: PR 7 ..." },
+    { "kind": "data", "data": { "pr": 7 } },
+    { "kind": "file", "file": { "name": "ci.log", "mimeType": "text/plain", "bytes": "<base64>" } }
+  ],
+  "metadata": { "sxfer": { "intent": "handoff", "subject": "Review PR 7", "hop": 0, "inReplyTo": null, "replyPort": 47100 } }
+}
+```
+
+`sxfer msg send <peer> message.json --a2a` sends one you built yourself. The inbox entry
+(`<inbox>/<sender fingerprint>-<messageId>.json`) wraps it with what the receiver verified.
+
 ## MCP server: let an AI assistant move files
 
 `sxfer-mcp` is a second binary that speaks the [Model Context Protocol](https://modelcontextprotocol.io)
@@ -82,6 +185,9 @@ claude mcp add sxfer -- sxfer-mcp          # Claude Code; other clients: command
 | `push_file` / `pull_file` | over SSH, like `sxfer push` / `pull` |
 | `start_listener` / `listener_status` / `stop_listener` | receive one file in the background; returns the code for the sender |
 | `discover_listeners`, `get_config` | read-only |
+| `send_message` | message another agent: a pinned peer by name, or `reply_to` an inbox message (`body`, `subject`, `intent`, `data`, `attach`) |
+| `inbox_list` / `inbox_read` / `inbox_wait` / `inbox_done` | this machine's `sxfer serve` inbox |
+| `save_attachments`, `list_peers` | write a message's files out; pinned peers and who's serving |
 
 Results name the peer it paired with (ML-DSA-65 fingerprint, pinned or not); `send_file` can skip
 the code for a receiver you pinned that runs `--trusted`, and `start_listener` takes `trusted`.
@@ -95,7 +201,8 @@ Rules that hold whatever the model asks:
 - **Files only.** Secrets would land in the model's context and the transcript, so there's no tool
   for them, and a listener started over MCP refuses them. Use `sxfer send` for passwords and OTPs.
 - **The network allowlist and pinned peers are yours.** The server reads `sxfer config` and
-  `sxfer trust` but can't change them.
+  `sxfer trust` but can't change them, and a `to` address the model gives `send_file` must be inside
+  your allowlist. Messages only ever go to pinned peers.
 - Paths must be absolute. SSH runs with `BatchMode=yes`: key or agent auth only, no prompts.
 
 ## Options (send / push / pull)
@@ -158,6 +265,8 @@ about 30 s and never interrupts a shred halfway.
   transcript hash; one key per direction, counter nonces.
 - File names from the sender are reduced to a bare name (no paths, no `..`).
 - Secrets are capped at 64 KiB, shown once on the receiver's terminal, and never written to disk.
+- Agent messages (`sxfer serve`) take the same channel with no code at all: both sides must be
+  pinned, and the sender refuses any listener that isn't the exact peer it addressed.
 
 What isn't post-quantum: **SSH mode** inherits your OpenSSH's key exchange (OpenSSH 9.0+ defaults to
 the hybrid `sntrup761x25519`, 9.9+ to `mlkem768x25519`) and its host keys, and has no signed

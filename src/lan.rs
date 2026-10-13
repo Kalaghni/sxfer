@@ -24,11 +24,14 @@
 //!            sender (re-hashing its source first, and asking first unless confirmation is off)
 //!            shred, and tells the listener whether it did (DONE).
 //!            Secrets (kind "text") are shown on the listener's screen and never written to disk.
+//!            Agent messages (kind "msg", `sxfer serve` only) go into its inbox: see mesh.rs.
 //! RECEIPTS   on the destination only (the listener). The sender keeps no record.
+//! SERVE      `serve_core` keeps accepting, one thread per connection, for `sxfer serve`.
 
 use crate::abort;
 use crate::common::*;
 use crate::identity::{self as id, SignedReceipt};
+use crate::mesh;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use hkdf::Hkdf;
@@ -45,7 +48,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -70,6 +73,10 @@ const MAX_BAD_CODES: u32 = 3;
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long the listener waits for DONE after its receipt: the sender may be answering the shred prompt.
 const DONE_TIMEOUT: Duration = Duration::from_secs(600);
+/// Messages have nothing to shred, so DONE follows the receipt at once.
+const MSG_DONE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Transfers `serve_core` handles at once; more connections are closed straight away.
+const MAX_CONNS: usize = 16;
 
 const T_HELLO: u8 = 0x05;
 const T_HEADER: u8 = 1;
@@ -272,10 +279,10 @@ fn transcript(first: &[u8], second: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// Check a peer whose signature verified against the pinned peers: Ok(pinned?).
-fn vet(name: &str, fp: &str, mode: u8, role: &str) -> R<bool> {
+/// Check a peer whose signature verified against the pinned peers: Ok(the name it's pinned as).
+fn vet(name: &str, fp: &str, mode: u8, role: &str) -> R<Option<String>> {
     match id::check_peer(name, fp) {
-        id::Known::Yes(_) => Ok(true),
+        id::Known::Yes(pinned) => Ok(Some(pinned)),
         id::Known::Changed { pinned_fp } => abort!(
             "KEY CHANGED: the {role} says it is {name}, but {name} is pinned to {} and this key is {}. \
 If {name} was reinstalled, run `sxfer trust remove {name}` and pair once with a code; \
@@ -287,7 +294,16 @@ otherwise something may be impersonating it.",
             "the {role} {name} [{}] isn't a pinned peer, so it needs the one-time code",
             id::short_fp(fp)
         ),
-        id::Known::New => Ok(false),
+        id::Known::New => Ok(None),
+    }
+}
+
+/// A verified peer, named as the user pinned it (a name it claims only counts until then).
+fn peer_info(claimed: &str, fp: String, pinned: Option<String>) -> PeerInfo {
+    PeerInfo {
+        known: pinned.is_some(),
+        name: pinned.unwrap_or_else(|| claimed.to_string()),
+        fingerprint: fp,
     }
 }
 
@@ -325,6 +341,14 @@ pub enum Received {
         sender: PeerInfo,
         text: String,
     },
+    /// An agent message, stored in the inbox
+    Message {
+        entry: PathBuf,
+        id: String,
+        /// a repeat of a message already in the inbox: acknowledged, not stored again
+        already: bool,
+        sender: PeerInfo,
+    },
 }
 
 pub struct ListenCfg {
@@ -342,6 +366,31 @@ pub struct ListenCfg {
     pub trusted: bool,
     /// pin a new sender after a successful transfer with the code
     pub remember: bool,
+    /// take files (`sxfer serve` without --files takes messages only)
+    pub accept_files: bool,
+    /// refuse senders that aren't pinned, code or not (`sxfer serve`)
+    pub pinned_only: bool,
+    /// take agent messages into this inbox (`sxfer serve`)
+    pub inbox: Option<Arc<mesh::Inbox>>,
+}
+
+impl ListenCfg {
+    /// A listener for files and secrets, as `sxfer listen` runs it.
+    pub fn new(bind: SocketAddr, dir: PathBuf, me: Arc<id::Identity>) -> ListenCfg {
+        ListenCfg {
+            bind,
+            dir,
+            advertise: true,
+            accept_text: true,
+            stop: None,
+            me,
+            trusted: false,
+            remember: false,
+            accept_files: true,
+            pinned_only: false,
+            inbox: None,
+        }
+    }
 }
 
 /// An mDNS advertisement; dropping it sends the "goodbye" and stops the responder.
@@ -369,12 +418,14 @@ fn advertise(port: u16, cfg: &ListenCfg) -> R<Advert> {
     let name = host_name();
     let fp = cfg.me.fingerprint();
     let trusted = if cfg.trusted { "1" } else { "0" };
+    let msg = if cfg.inbox.is_some() { "1" } else { "0" };
     let props: HashMap<String, String> = [
         ("id", id.as_str()),
         ("name", name.as_str()),
         ("v", "2"),
         ("fp", fp.as_str()),
         ("trusted", trusted),
+        ("msg", msg),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -395,13 +446,12 @@ fn advertise(port: u16, cfg: &ListenCfg) -> R<Advert> {
     Ok(Advert { daemon, fullname })
 }
 
-/// Wait for one successful transfer with `code`. `ready` is called with the bound TCP port.
-pub fn listen_core(cfg: &ListenCfg, code: &str, ready: &mut dyn FnMut(u16)) -> R<Received> {
+/// Bind, advertise (dropping the Advert withdraws it) and report the port to `ready`.
+fn open(cfg: &ListenCfg, ready: &mut dyn FnMut(u16)) -> R<(TcpListener, Option<Advert>)> {
     let tcp = TcpListener::bind(cfg.bind)
         .map_err(|e| Abort(format!("cannot listen on {}: {e}", cfg.bind)))?;
     let port = tcp.local_addr()?.port();
-    // held until we return; dropping it withdraws the advertisement
-    let _advert = if cfg.advertise {
+    let advert = if cfg.advertise {
         match advertise(port, cfg) {
             Ok(a) => Some(a),
             Err(e) => {
@@ -415,30 +465,43 @@ pub fn listen_core(cfg: &ListenCfg, code: &str, ready: &mut dyn FnMut(u16)) -> R
         None
     };
     ready(port);
-    let code = normalize_code(code);
     if cfg.stop.is_some() {
         tcp.set_nonblocking(true)?; // poll, so the stop flag is noticed
     }
-    let mut bad = 0;
-    let result = loop {
-        let (stream, peer) = match tcp.accept() {
-            Ok(x) => x,
+    Ok((tcp, advert))
+}
+
+/// The next connection, or None once `cfg.stop` is set.
+fn next_conn(tcp: &TcpListener, cfg: &ListenCfg) -> Option<(TcpStream, SocketAddr)> {
+    loop {
+        match tcp.accept() {
+            Ok((stream, peer)) => {
+                let _ = stream.set_nonblocking(false); // inherited from the listener on some platforms
+                let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+                let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+                return Some((stream, peer));
+            }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 if cfg.stop.as_ref().is_some_and(|s| s.load(Ordering::Relaxed)) {
-                    break Err(Abort("listener stopped".into()));
+                    return None;
                 }
                 std::thread::sleep(Duration::from_millis(200));
-                continue;
             }
-            Err(e) => {
-                say(&format!("accept failed: {e}"));
-                continue;
-            }
+            Err(e) => say(&format!("accept failed: {e}")),
+        }
+    }
+}
+
+/// Wait for one successful transfer with `code`. `ready` is called with the bound TCP port.
+pub fn listen_core(cfg: &ListenCfg, code: &str, ready: &mut dyn FnMut(u16)) -> R<Received> {
+    let (tcp, _advert) = open(cfg, ready)?;
+    let code = normalize_code(code);
+    let mut bad = 0;
+    let result = loop {
+        let Some((stream, peer)) = next_conn(&tcp, cfg) else {
+            break Err(Abort("listener stopped".into()));
         };
-        let _ = stream.set_nonblocking(false); // inherited from the listener on some platforms
-        let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
-        let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-        match handle(stream, &code, cfg) {
+        match handle(stream, &code, cfg, peer) {
             Ok(r) => break Ok(r),
             Err(e) if e.0 == BAD_CODE => {
                 bad += 1;
@@ -453,7 +516,43 @@ pub fn listen_core(cfg: &ListenCfg, code: &str, ready: &mut dyn FnMut(u16)) -> R
     result
 }
 
-fn handle(mut s: TcpStream, code: &str, cfg: &ListenCfg) -> R<Received> {
+/// What `serve_core` reports for each connection: who connected and how it went.
+pub type OnTransfer = dyn Fn(SocketAddr, R<Received>) + Send + Sync;
+
+/// Keep accepting until `cfg.stop` is set, each connection on its own thread, and hand every
+/// outcome to `on_transfer`. There's no code to guess here, so wrong ones never close it; use
+/// it with `pinned_only` (and `trusted`), as `sxfer serve` does.
+pub fn serve_core(
+    cfg: Arc<ListenCfg>,
+    ready: &mut dyn FnMut(u16),
+    on_transfer: Arc<OnTransfer>,
+) -> R<()> {
+    let (tcp, _advert) = open(&cfg, ready)?;
+    // unguessable and never shown: the code path can't succeed, so only pinned peers get in
+    let code = Arc::new(random_hex(32));
+    let busy = Arc::new(AtomicUsize::new(0));
+    while let Some((stream, peer)) = next_conn(&tcp, &cfg) {
+        if busy.load(Ordering::SeqCst) >= MAX_CONNS {
+            say(&format!("{peer}: too many transfers at once; closed"));
+            continue;
+        }
+        busy.fetch_add(1, Ordering::SeqCst);
+        let (cfg, code, busy, report) = (
+            Arc::clone(&cfg),
+            Arc::clone(&code),
+            Arc::clone(&busy),
+            Arc::clone(&on_transfer),
+        );
+        spawn_big(move || {
+            let r = handle(stream, &code, &cfg, peer);
+            busy.fetch_sub(1, Ordering::SeqCst);
+            report(peer, r);
+        });
+    }
+    Ok(())
+}
+
+fn handle(mut s: TcpStream, code: &str, cfg: &ListenCfg, peer_addr: SocketAddr) -> R<Received> {
     let dir = &cfg.dir;
     let first = read_frame(&mut s)?;
     if first.starts_with(OLD_MAGIC) {
@@ -501,12 +600,15 @@ fn handle(mut s: TcpStream, code: &str, cfg: &ListenCfg) -> R<Received> {
         if mode == MODE_TRUSTED && !cfg.trusted {
             abort!("this listener needs its one-time code (start it with --trusted to skip that for pinned peers)");
         }
-        let known = vet(&hello.name, &fp, mode, "sender")?;
-        Ok(PeerInfo {
-            name: hello.name.clone(),
-            fingerprint: fp,
-            known,
-        })
+        let pinned = vet(&hello.name, &fp, mode, "sender")?;
+        if cfg.pinned_only && pinned.is_none() {
+            abort!(
+                "{} [{}] isn't pinned here, and this listener only takes pinned peers (`sxfer trust add` on it)",
+                hello.name,
+                id::short_fp(&fp)
+            );
+        }
+        Ok(peer_info(&hello.name, fp, pinned))
     });
     let sender = match checked {
         Ok(p) => p,
@@ -582,8 +684,20 @@ fn handle(mut s: TcpStream, code: &str, cfg: &ListenCfg) -> R<Received> {
         }
         return Ok(Received::Text { sender, text });
     }
+    if h.kind == "msg" {
+        return receive_message(ch, cfg, &h, sender.clone(), peer_addr, &sign_receipt);
+    }
     if h.kind != "file" {
         abort!("unknown kind {:?}", h.kind);
+    }
+    if !cfg.accept_files {
+        ch.send_json(
+            T_REJECT,
+            &Reason {
+                reason: "this listener takes agent messages only (start `sxfer serve` with --files to take files)".into(),
+            },
+        )?;
+        abort!("rejected a file (messages only)");
     }
 
     let name = safe_name(&h.name)?;
@@ -680,6 +794,98 @@ fn handle(mut s: TcpStream, code: &str, cfg: &ListenCfg) -> R<Received> {
     })
 }
 
+/// The rest of a "msg" transfer: policy first (before a byte of it is accepted), then the body,
+/// stored in the inbox and read back from disk before the receipt is signed.
+fn receive_message(
+    mut ch: Chan,
+    cfg: &ListenCfg,
+    h: &Header,
+    sender: PeerInfo,
+    peer_addr: SocketAddr,
+    sign_receipt: &dyn Fn(Option<String>, bool) -> R<SignedReceipt>,
+) -> R<Received> {
+    let refuse = |ch: &mut Chan, reason: String| -> R<Received> {
+        let _ = ch.send_json(
+            T_REJECT,
+            &Reason {
+                reason: reason.clone(),
+            },
+        );
+        Err(Abort(format!(
+            "refused a message from {}: {reason}",
+            sender.describe()
+        )))
+    };
+    let Some(inbox) = &cfg.inbox else {
+        return refuse(
+            &mut ch,
+            "this listener doesn't take agent messages (the receiver runs `sxfer serve` for that)"
+                .into(),
+        );
+    };
+    if let Err(e) = mesh::check_id(&h.name) {
+        return refuse(&mut ch, e.0);
+    }
+    if h.size > mesh::MAX_MSG {
+        return refuse(
+            &mut ch,
+            format!("message too large (max {} MiB)", mesh::MAX_MSG >> 20),
+        );
+    }
+    if let Some(entry) = inbox.find_delivered(&sender.fingerprint, &h.name) {
+        // a retry whose receipt got lost: acknowledge again, but store and trigger nothing
+        let signed = sign_receipt(Some(entry.to_string_lossy().into_owned()), true)?;
+        ch.send_json(T_RECEIPT, &signed)?;
+        let _ = ch.s.set_read_timeout(Some(MSG_DONE_TIMEOUT));
+        let _ = ch.recv(); // DONE
+        return Ok(Received::Message {
+            entry,
+            id: h.name.clone(),
+            already: true,
+            sender,
+        });
+    }
+    if let Err(e) = inbox.admit(&sender.fingerprint) {
+        return refuse(&mut ch, e.0);
+    }
+    ch.send(T_ACCEPT, b"{}")?;
+    let data = recv_all_mem(&mut ch, h.size)?;
+    let stored = if data.len() as u64 != h.size || sha256_bytes(&data) != h.sha256 {
+        Err(Abort("message corrupted in transit".into()))
+    } else {
+        inbox.store(&sender, peer_addr, &h.name, &data)
+    };
+    let (entry, already) = match stored {
+        Ok(x) => x,
+        Err(e) => {
+            let _ = ch.send_json(
+                T_FAIL,
+                &Reason {
+                    reason: e.0.clone(),
+                },
+            );
+            return Err(e);
+        }
+    };
+    let signed = sign_receipt(Some(entry.to_string_lossy().into_owned()), already)?;
+    ch.send_json(T_RECEIPT, &signed)?;
+    let _ = ch.s.set_read_timeout(Some(MSG_DONE_TIMEOUT));
+    let _ = ch.recv(); // DONE
+    if !already {
+        receipt_local(
+            &json!({"time": now_iso(), "op": "msg", "from": sender.name, "id": h.name,
+            "entry": entry.to_string_lossy(), "bytes": h.size, "sha256": h.sha256,
+            "sender_fp": sender.fingerprint, "signed_receipt": signed}),
+        )?;
+    }
+    Ok(Received::Message {
+        entry,
+        id: h.name.clone(),
+        already,
+        sender,
+    })
+}
+
 fn recv_all_mem(ch: &mut Chan, size: u64) -> R<Vec<u8>> {
     let mut v = Vec::new();
     loop {
@@ -698,7 +904,7 @@ fn recv_all_mem(ch: &mut Chan, size: u64) -> R<Vec<u8>> {
 }
 
 /// Only a plain file name: no directories, no traversal, no control characters.
-fn safe_name(n: &str) -> R<String> {
+pub(crate) fn safe_name(n: &str) -> R<String> {
     let base = n.rsplit(['/', '\\']).next().unwrap_or("");
     if base.is_empty()
         || base == "."
@@ -716,6 +922,11 @@ fn safe_name(n: &str) -> R<String> {
 pub enum Payload {
     File(PathBuf),
     Text(String),
+    /// an agent message (A2A JSON) for a `sxfer serve` inbox; `id` is its messageId
+    Message {
+        id: String,
+        bytes: Vec<u8>,
+    },
 }
 
 pub struct Sent {
@@ -740,6 +951,8 @@ pub struct SendOpts<'a> {
     pub me: &'a id::Identity,
     /// pin the listener after a successful transfer with the code
     pub remember: bool,
+    /// only this listener (fingerprint): anyone else is refused before anything is sent
+    pub expect_fp: Option<String>,
 }
 
 pub fn send_core(addr: SocketAddr, payload: &Payload, sc: &ShredCfg, o: &SendOpts) -> R<Sent> {
@@ -766,6 +979,13 @@ pub fn send_core(addr: SocketAddr, payload: &Payload, sc: &ShredCfg, o: &SendOpt
             sha256_bytes(t.as_bytes()),
             t.len() as u64,
         ),
+        Payload::Message { id, bytes } => {
+            mesh::check_id(id)?;
+            if bytes.len() as u64 > mesh::MAX_MSG {
+                abort!("message too large (max {} MiB)", mesh::MAX_MSG >> 20);
+            }
+            (id.clone(), "msg", sha256_bytes(bytes), bytes.len() as u64)
+        }
     };
 
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(10))
@@ -819,12 +1039,18 @@ pub fn send_core(addr: SocketAddr, payload: &Payload, sc: &ShredCfg, o: &SendOpt
         _ => abort!("protocol error: expected hello"),
     };
     let fp = hello.verify(id::CTX_LISTENER, &tr)?;
-    let known = vet(&hello.name, &fp, mode, "listener")?;
-    let listener = PeerInfo {
-        name: hello.name,
-        fingerprint: fp,
-        known,
-    };
+    if let Some(want) = &o.expect_fp {
+        if &fp != want {
+            abort!(
+                "{addr} is {} [{}], not the peer you addressed [{}]; nothing was sent",
+                hello.name,
+                id::short_fp(&fp),
+                id::short_fp(want)
+            );
+        }
+    }
+    let pinned = vet(&hello.name, &fp, mode, "listener")?;
+    let listener = peer_info(&hello.name, fp, pinned);
     say(&format!("paired with {}", listener.describe()));
 
     ch.send_json(
@@ -859,6 +1085,11 @@ pub fn send_core(addr: SocketAddr, payload: &Payload, sc: &ShredCfg, o: &SendOpt
                     }
                 }
                 Payload::Text(tx) => ch.send(T_DATA, tx.as_bytes())?,
+                Payload::Message { bytes, .. } => {
+                    for chunk in bytes.chunks(CHUNK) {
+                        ch.send(T_DATA, chunk)?;
+                    }
+                }
             }
             ch.send(T_END, &[])?;
             if kind == "file" {
@@ -970,6 +1201,8 @@ pub struct Found {
     pub fingerprint: Option<String>,
     /// started with --trusted: pinned senders may skip the code
     pub trusted: bool,
+    /// `sxfer serve`: takes agent messages
+    pub msg: bool,
 }
 
 impl Found {
@@ -993,6 +1226,16 @@ impl Found {
             .collect();
         a.sort_by_key(|ip| !ip.is_ipv4());
         a.first().map(|ip| SocketAddr::new(**ip, self.port))
+    }
+
+    /// Every advertised address, those inside `nets` first, then IPv4 before IPv6. For a peer
+    /// whose key is checked on connect (`SendOpts::expect_fp`), where the allowlist isn't the guard.
+    pub fn all_addrs(&self, nets: &[IpNet]) -> Vec<SocketAddr> {
+        let mut a: Vec<&IpAddr> = self.addrs.iter().collect();
+        a.sort_by_key(|ip| (!nets.iter().any(|n| n.contains(*ip)), !ip.is_ipv4()));
+        a.into_iter()
+            .map(|ip| SocketAddr::new(*ip, self.port))
+            .collect()
     }
 }
 
@@ -1030,6 +1273,7 @@ pub fn discover(wait: Duration) -> R<Vec<Found>> {
                         version: prop("v").unwrap_or_default(),
                         fingerprint: prop("fp"),
                         trusted: prop("trusted").as_deref() == Some("1"),
+                        msg: prop("msg").as_deref() == Some("1"),
                     });
                 }
             }
@@ -1083,11 +1327,7 @@ mod tests {
         }
     }
 
-    /// Point ~/.sxfer at a test directory. Every helper that leads to the trust store calls this
-    /// first, so no test (whatever order they run in) touches the real one.
-    fn test_home() {
-        std::env::set_var("SXFER_HOME", std::env::temp_dir().join("sxfer-test-home"));
-    }
+    use crate::common::testing::{home as test_home, PINNING};
 
     /// A fresh identity with a unique name, so tests sharing the trust store don't collide.
     fn ident(role: &str) -> id::Identity {
@@ -1095,21 +1335,11 @@ mod tests {
         id::Identity::from_seed(&id::new_seed(), &format!("{role}-{}", random_hex(4)))
     }
 
-    /// Tests that pin peers take turns: they share ~/.sxfer/known_peers.json.
-    static PINNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn listen_cfg(dir: PathBuf, me: id::Identity) -> ListenCfg {
         test_home();
-        ListenCfg {
-            bind: "127.0.0.1:0".parse().unwrap(),
-            dir,
-            advertise: false,
-            accept_text: true,
-            stop: None,
-            me: Arc::new(me),
-            trusted: false,
-            remember: false,
-        }
+        let mut cfg = ListenCfg::new("127.0.0.1:0".parse().unwrap(), dir, Arc::new(me));
+        cfg.advertise = false;
+        cfg
     }
 
     fn spawn_listener(
@@ -1133,6 +1363,7 @@ mod tests {
             auth,
             me,
             remember: false,
+            expect_fp: None,
         };
         send_core(addr, payload, &sc(), &o)
     }
@@ -1177,7 +1408,9 @@ mod tests {
         let mut cfg = listen_cfg(dst_dir, listener);
         cfg.trusted = true;
         id::pin(&cfg.me.name, &cfg.me.fingerprint()).unwrap();
-        id::pin(&sender.name, &sender.fingerprint()).unwrap();
+        // pinned under the user's own name for it, not the one it claims
+        let alias = format!("my-{}", sender.name);
+        id::pin(&alias, &sender.fingerprint()).unwrap();
         let (port, h) = spawn_listener(cfg, "999-000");
         let sent = send_as(
             &sender,
@@ -1187,7 +1420,10 @@ mod tests {
         );
         let sent = sent.unwrap();
         assert!(sent.listener.known && sent.shredded && !src.exists());
-        assert!(h.join().unwrap().is_ok());
+        match h.join().unwrap().unwrap() {
+            Received::File { sender: s, .. } => assert_eq!(s.name, alias),
+            _ => panic!("expected a file"),
+        }
     }
 
     #[test]
@@ -1312,16 +1548,9 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let (dir, flag) = (tmpdir("dst"), stop.clone());
         let h = std::thread::spawn(move || {
-            let cfg = ListenCfg {
-                bind: "127.0.0.1:0".parse().unwrap(),
-                dir,
-                advertise: false,
-                accept_text: false,
-                stop: Some(flag),
-                me: Arc::new(ident("listener")),
-                trusted: false,
-                remember: false,
-            };
+            let mut cfg = listen_cfg(dir, ident("listener"));
+            cfg.accept_text = false;
+            cfg.stop = Some(flag);
             listen_core(&cfg, "321-321", &mut |p| tx.send(p).unwrap())
         });
         let port = rx.recv().unwrap();
@@ -1395,16 +1624,11 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let dir = tmpdir("dst");
         std::thread::spawn(move || {
-            let cfg = ListenCfg {
-                bind: "0.0.0.0:0".parse().unwrap(),
+            let cfg = ListenCfg::new(
+                "0.0.0.0:0".parse().unwrap(),
                 dir,
-                advertise: true,
-                accept_text: true,
-                stop: None,
-                me: Arc::new(ident("listener")),
-                trusted: false,
-                remember: false,
-            };
+                Arc::new(ident("listener")),
+            );
             listen_core(&cfg, "777-777", &mut |p| tx.send(p).unwrap())
         });
         let port = rx.recv().unwrap();
@@ -1431,6 +1655,7 @@ mod tests {
             version: "2".into(),
             fingerprint: None,
             trusted: false,
+            msg: false,
         };
         let lan: Vec<IpNet> = vec!["192.168.2.0/24".parse().unwrap()];
         assert_eq!(f.addr_in(&lan), Some("192.168.2.50:50123".parse().unwrap()));

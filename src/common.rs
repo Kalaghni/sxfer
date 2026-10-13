@@ -228,7 +228,8 @@ pub fn sxfer_dir() -> PathBuf {
         .join(".sxfer")
 }
 
-fn private_dir(d: &Path) -> R<()> {
+/// Create `d` (and parents), owner-only on unix.
+pub fn private_dir(d: &Path) -> R<()> {
     fs::create_dir_all(d)?;
     #[cfg(unix)]
     {
@@ -260,6 +261,16 @@ pub fn now_iso() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("{t}")
+}
+
+/// Seconds as "45s", "12m", "3h", "2d".
+pub fn span(s: u64) -> String {
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m", s / 60),
+        3600..=86399 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86400),
+    }
 }
 
 pub fn host_name() -> String {
@@ -307,4 +318,17 @@ pub fn rename_no_clobber(from: &Path, to: &Path) -> R<()> {
         fs::rename(from, to).map_err(|e| Abort(format!("commit: {e}")))?;
     }
     Ok(())
+}
+
+/// Test support for modules whose tests touch ~/.sxfer.
+#[cfg(test)]
+pub mod testing {
+    /// Tests that pin peers take turns: they share ~/.sxfer/known_peers.json.
+    pub static PINNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Point ~/.sxfer at a test directory. Every helper that leads to the trust store calls this
+    /// first, so no test (whatever order they run in) touches the real one.
+    pub fn home() {
+        std::env::set_var("SXFER_HOME", std::env::temp_dir().join("sxfer-test-home"));
+    }
 }

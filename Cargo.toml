@@ -1,8 +1,8 @@
 [package]
 name = "sxfer"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
-description = "Move a file or a secret between machines: encrypted, proven receipt, then shred the source."
+description = "Move a file, a secret or an agent's message between machines: encrypted, proven receipt, then shred the source."
 license = "MIT"
 repository = "https://github.com/Kalaghni/sxfer"
 readme = "README.md"
@@ -28,6 +28,7 @@ ml-dsa = "0.1.1"
 ml-kem = { version = "0.3.2", features = ["getrandom"] }
 getrandom = { version = "0.4.3", features = ["sys_rng"] }
 spki = { version = "0.8.1", features = ["pem"] }
+base64 = "0.22"
 
 [workspace]
 members = ["sxfer-mcp"]

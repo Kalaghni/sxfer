@@ -6,7 +6,7 @@ use crate::common::*;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 #[derive(Serialize, Deserialize, Default)]
@@ -54,6 +54,28 @@ pub fn parse_net(s: &str) -> R<IpNet> {
 
 pub fn networks() -> R<Vec<IpNet>> {
     load().networks.iter().map(|s| parse_net(s)).collect()
+}
+
+/// For addresses a model chose (the MCP server): inside a configured network, or this machine.
+pub fn check_allowed(addr: &SocketAddr) -> R<()> {
+    let nets = networks()?;
+    allowed_in(addr, &nets)
+}
+
+fn allowed_in(addr: &SocketAddr, nets: &[IpNet]) -> R<()> {
+    if addr.ip().is_loopback() || nets.iter().any(|n| n.contains(&addr.ip())) {
+        return Ok(());
+    }
+    abort!(
+        "{} isn't inside a configured network ({}); the user can allow it with `sxfer config add {}`",
+        addr.ip(),
+        if nets.is_empty() {
+            "none configured".to_string()
+        } else {
+            nets.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ")
+        },
+        addr.ip()
+    )
 }
 
 pub fn add(s: &str) -> R<()> {
@@ -111,5 +133,24 @@ pub fn list() {
     }
     for n in c.networks {
         println!("{n}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allowlist_for_chosen_addresses() {
+        let nets = vec![parse_net("192.168.2.0/24").unwrap()];
+        let at = |s: &str| s.parse::<SocketAddr>().unwrap();
+        assert!(allowed_in(&at("192.168.2.50:5000"), &nets).is_ok());
+        assert!(
+            allowed_in(&at("127.0.0.1:5000"), &nets).is_ok(),
+            "this machine"
+        );
+        let e = allowed_in(&at("203.0.113.9:5000"), &nets).unwrap_err();
+        assert!(e.0.contains("sxfer config add 203.0.113.9"), "{e}");
+        assert!(allowed_in(&at("192.168.2.50:5000"), &[]).is_err());
     }
 }

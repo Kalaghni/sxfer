@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cross-compile release binaries for every platform from one Linux box (or WSL) into dist/.
+# Cross-compile sxfer + sxfer-mcp for every platform from one Linux box (or WSL) into dist/.
 # Needs: rustup targets below, zig (`pip install ziglang`), cargo-zigbuild (`cargo install cargo-zigbuild`).
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -20,9 +20,10 @@ for t in "${TARGETS[@]}"; do
   printf '%-28s ' "$t"
   if cargo zigbuild --release --locked --target "$t" >"/tmp/sxfer-build-$t.log" 2>&1; then
     ext=""; [[ $t == *windows* ]] && ext=".exe"
-    out="dist/sxfer-$VER-$t$ext"
-    cp "$CARGO_TARGET_DIR/$t/release/sxfer$ext" "$out"
-    echo "ok   $(du -h "$out" | cut -f1)"
+    for bin in sxfer sxfer-mcp; do
+      cp "$CARGO_TARGET_DIR/$t/release/$bin$ext" "dist/$bin-$VER-$t$ext"
+    done
+    echo "ok   $(du -h "dist/sxfer-$VER-$t$ext" | cut -f1) + $(du -h "dist/sxfer-mcp-$VER-$t$ext" | cut -f1)"
   else
     echo "FAILED (see /tmp/sxfer-build-$t.log)"; grep -m3 -E 'error' "/tmp/sxfer-build-$t.log"; fail=1
   fi

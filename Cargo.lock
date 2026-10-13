@@ -676,7 +676,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "sxfer"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "chacha20poly1305",
  "clap",
@@ -691,6 +691,14 @@ dependencies = [
  "serde_json",
  "sha2",
  "spake2",
+]
+
+[[package]]
+name = "sxfer-mcp"
+version = "0.6.0"
+dependencies = [
+ "serde_json",
+ "sxfer",
 ]
 
 [[package]]

@@ -22,6 +22,10 @@ fn q(s: &str) -> String {
 
 fn ssh_cmd(host: &str, script: &str) -> Command {
     let mut c = Command::new("ssh");
+    if std::env::var_os("SXFER_SSH_BATCH").is_some() {
+        // no password or host-key prompt that nobody would see (set by sxfer-mcp)
+        c.args(["-o", "BatchMode=yes"]);
+    }
     c.args([
         "-o",
         "ConnectTimeout=15",
@@ -193,7 +197,8 @@ fn mbps(n: u64, t: Instant) -> f64 {
     n as f64 / t.elapsed().as_secs_f64().max(0.001) / 1e6
 }
 
-pub fn push(src: &Path, target: &str, sc: &ShredCfg) -> R<()> {
+/// Returns whether the local source was shredded.
+pub fn push(src: &Path, target: &str, sc: &ShredCfg) -> R<bool> {
     let (host, dest) = split_remote(target)?;
     if !src.is_file() {
         abort!("not a regular file: {}", src.display());
@@ -290,17 +295,13 @@ fn finish_push(
     h0: &str,
     n0: u64,
     sc: &ShredCfg,
-) -> R<()> {
+) -> R<bool> {
     let mut shredded = false;
+    let shown = src.display();
+    let question = format!("Receipt confirmed on {host}. Shred local {shown}?");
     if sc.keep {
         say("5/6 --keep: source left in place");
-    } else if confirm(
-        &format!(
-            "Receipt confirmed on {host}. Shred local {}?",
-            src.display()
-        ),
-        sc.ask,
-    ) {
+    } else if sc.confirm(&question) {
         shred_local(src, sc.passes)?;
         shredded = true;
         say(&format!(
@@ -322,7 +323,7 @@ fn finish_push(
             "6/6 WARNING: could not write the receipt on {host}; the transfer itself is complete"
         )),
     }
-    Ok(())
+    Ok(shredded)
 }
 
 fn local_dest(dest: &Path, name: &str) -> R<PathBuf> {
@@ -342,7 +343,8 @@ fn local_dest(dest: &Path, name: &str) -> R<PathBuf> {
     Ok(d)
 }
 
-pub fn pull(source: &str, dest: &Path, sc: &ShredCfg) -> R<()> {
+/// Returns whether the remote source was shredded.
+pub fn pull(source: &str, dest: &Path, sc: &ShredCfg) -> R<bool> {
     let (host, src) = split_remote(source)?;
     let st = parse(&run(&host, &r_stat(&src))?, "stat", 3)?;
     let (h0, n0) = (st[0].clone(), st[1].parse::<u64>().unwrap_or(u64::MAX));
@@ -412,14 +414,12 @@ pub fn pull(source: &str, dest: &Path, sc: &ShredCfg) -> R<()> {
     finish_pull(&host, &src, &dest, &h0, n0, sc)
 }
 
-fn finish_pull(host: &str, src: &str, dest: &Path, h0: &str, n0: u64, sc: &ShredCfg) -> R<()> {
+fn finish_pull(host: &str, src: &str, dest: &Path, h0: &str, n0: u64, sc: &ShredCfg) -> R<bool> {
     let mut shredded = false;
+    let question = format!("Receipt confirmed locally. Shred {host}:{src}?");
     if sc.keep {
         say("5/6 --keep: remote source left in place");
-    } else if confirm(
-        &format!("Receipt confirmed locally. Shred {host}:{src}?"),
-        sc.ask,
-    ) {
+    } else if sc.confirm(&question) {
         let r = run(host, &r_shred(src, sc.passes)).and_then(|o| parse(&o, "remote shred", 1));
         if let Err(e) = r {
             abort!(
@@ -442,5 +442,5 @@ fn finish_pull(host: &str, src: &str, dest: &Path, h0: &str, n0: u64, sc: &Shred
         "dest": abs.to_string_lossy(), "bytes": n0, "sha256": h0, "shredded": shredded}),
     )?;
     say(&format!("6/6 receipt  {}", p.display()));
-    Ok(())
+    Ok(shredded)
 }

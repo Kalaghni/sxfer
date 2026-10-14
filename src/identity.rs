@@ -178,6 +178,9 @@ pub struct Peer {
     pub name: String,
     pub fingerprint: String,
     pub added: String,
+    /// where its `sxfer serve` listens (host:port), for networks mDNS doesn't reach (VPNs)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub addr: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -249,9 +252,41 @@ pub fn pin(name: &str, fp: &str) -> R<bool> {
         name: name.to_string(),
         fingerprint: fp,
         added: now_iso(),
+        addr: None,
     });
     save_peers(&k)?;
     Ok(true)
+}
+
+/// A pinned peer by name (any case) or full fingerprint.
+pub fn find_peer(which: &str) -> R<Peer> {
+    let fp = normalize_fp(which).ok();
+    load_peers()
+        .peers
+        .into_iter()
+        .find(|p| p.name.eq_ignore_ascii_case(which) || Some(&p.fingerprint) == fp.as_ref())
+        .ok_or_else(|| {
+            Abort(format!(
+                "{which} isn't a pinned peer (see `sxfer trust list`)"
+            ))
+        })
+}
+
+/// Set (or with None, clear) where a pinned peer's `sxfer serve` listens.
+pub fn set_addr(which: &str, addr: Option<&str>) -> R<Peer> {
+    let mut k = load_peers();
+    let fp = normalize_fp(which).ok();
+    let Some(p) = k
+        .peers
+        .iter_mut()
+        .find(|p| p.name.eq_ignore_ascii_case(which) || Some(&p.fingerprint) == fp.as_ref())
+    else {
+        abort!("{which} isn't a pinned peer (see `sxfer trust list`)");
+    };
+    p.addr = addr.map(str::to_string);
+    let p = p.clone();
+    save_peers(&k)?;
+    Ok(p)
 }
 
 /// Unpin by name or fingerprint.

@@ -1,8 +1,8 @@
 [package]
 name = "sxfer-mcp"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
-description = "sxfer as a Model Context Protocol server: an AI assistant moves the file, the user decides on shredding."
+description = "sxfer as a Model Context Protocol server: an AI assistant moves files and messages other agents, the user decides on shredding."
 license = "MIT"
 repository = "https://github.com/Kalaghni/sxfer"
 rust-version = "1.85"
